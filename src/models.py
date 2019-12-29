@@ -71,20 +71,20 @@ class Attention(nn.Module):
 
         encoder_feature = self.W_h(encoder_outputs)
         dec_fea = self.decode_proj(s_t_hat) # B x 2*hidden_dim
-        dec_fea_expanded = dec_fea.unsqueeze(1).expand(b, t_k, n).contiguous() # B x t_k x 2*hidden_dim
-        dec_fea_expanded = dec_fea_expanded.view(-1, n)  # B * t_k x 2*hidden_dim
+        dec_fea_expanded = dec_fea.expand(b, t_k, n).contiguous() # B x t_k x 2*hidden_dim
 
         att_features = encoder_feature + dec_fea_expanded # B * t_k x 2*hidden_dim
+        # att_features = att_features.view(-1, n)  # B * t_k x 2*hidden_dim
 
-        coverage_input = coverage.view(-1, 1)  # B * t_k x 1
-        coverage_feature = self.W_c(coverage_input)  # B * t_k x 2*hidden_dim
+        # coverage_input = coverage.view(-1, 1)  # B * t_k x 1
+        coverage_feature = self.W_c(coverage.unsqueeze(-1))  # B * t_k x 2*hidden_dim
         att_features = att_features + coverage_feature
 
         e = F.tanh(att_features) # B * t_k x 2*hidden_dim
-        scores = self.v(e)  # B * t_k x 1
-        scores = scores.view(-1, t_k)  # B x t_k
+        scores = self.v(e).squeeze() # B * t_k x 1
+        # scores = scores.view(-1, t_k)  # B x t_k
 
-        attn_dist_ = F.softmax(scores, dim=1)*enc_padding_mask # B x t_k
+        attn_dist_ = F.softmax(scores, dim=1)*enc_padding_mask.float() # B x t_k
         normalization_factor = attn_dist_.sum(1, keepdim=True)
         attn_dist = attn_dist_ / normalization_factor
 
@@ -92,10 +92,7 @@ class Attention(nn.Module):
         c_t = torch.bmm(attn_dist, encoder_outputs)  # B x 1 x n
         c_t = c_t.view(-1, self.dim)  # B x 2*hidden_dim
 
-        attn_dist = attn_dist.view(-1, t_k)  # B x t_k
-
-        coverage = coverage.view(-1, t_k)
-        coverage = coverage + attn_dist
+        coverage = coverage + attn_dist.squeeze(1)
 
         return c_t, attn_dist, coverage
 
@@ -898,31 +895,30 @@ class NetGen(AbstractVAE):
         Encoder is GRU with FC layers connected to last hidden unit
         """
         self.encoder = nn.LSTM(self.emb_dim, h_dim, bidirectional=True, batch_first=True)
+        self.encoder_fc_c = nn.Linear(self.node_dim, h_dim)
+        self.encoder_fc_h = nn.Linear(self.node_dim, h_dim)
         self.encoder_ = nn.ModuleList([
-            self.encoder
+            self.encoder, self.encoder_fc_c, self.encoder_fc_h
         ])
 
         """
         Decoder is GRU with `z` appended at its inputs
         """
-        self.decoder_h_linear = nn.Linear(self.n_node * self.node_dim, self.node_dim)
-        self.decoder_c_linear = nn.Linear(self.n_node * self.node_dim, self.node_dim)
-        self.decoder = nn.LSTM(self.emb_dim, self.node_dim, dropout=0.3, batch_first=True)
+        self.decoder_h_linear = nn.Linear(self.n_node * self.node_dim, h_dim)
+        self.decoder_c_linear = nn.Linear(self.n_node * self.node_dim, h_dim)
+        self.decoder = nn.LSTM(self.emb_dim, h_dim, dropout=0.3, batch_first=True)
         # self.decoder_fc = nn.Linear(n_node * self.emb_dim, n_vocab)
-        self.decoder_fc = nn.Linear(self.node_dim, self.n_vocab)
+        self.decoder_fc = nn.Linear(h_dim, self.n_vocab)
 
         """
         Generator 
         """
-        self.generate_lstm = nn.LSTM(self.node_dim, self.node_dim, batch_first=True)
-        self.k_linear = nn.Linear(self.node_dim, self.node_dim, bias=False)
-        self.q_linear = nn.Linear(self.node_dim, self.node_dim, bias=False)
-        self.v_linear = nn.Linear(self.node_dim, self.node_dim, bias=False)
+        self.generate_lstm = nn.LSTM(self.node_dim, h_dim, batch_first=True)
+        self.attention_network = Attention(self.node_dim)
         self.generate_adj = nn.Sequential(
-            nn.Linear(self.node_dim, self.node_dim // 2, bias=False),
-            nn.Tanh(),
-            nn.Linear(self.node_dim // 2, self.node_dim // 4, bias=False),
-            nn.Tanh()
+            nn.Linear(self.node_dim, self.node_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.node_dim // 2, self.node_dim // 4)
         )
 
 
@@ -933,7 +929,7 @@ class NetGen(AbstractVAE):
         self.graph_encoder_fc = nn.Linear(2 * self.node_dim, self.node_dim, bias=False)
         self.decoder_ = nn.ModuleList([
             self.decoder, self.decoder_fc, self.decoder_c_linear, self.decoder_h_linear,
-            self.k_linear, self.q_linear, self.v_linear,
+            self.attention_network,
             self.generate_lstm, self.generate_adj,
             self.graph_encoder, self.graph_encoder_fc
         ])
@@ -991,8 +987,13 @@ class NetGen(AbstractVAE):
         """
         Inputs is embeddings of: seq_len x mbsize x emb_dim
         """
-        outputs, h = self.encoder(inputs)
-        return outputs, h
+        outputs, (h, c) = self.encoder(inputs)
+        bsize = inputs.size()[0]
+        h = h.view(1, bsize, -1)
+        c = c.view(1, bsize, -1)
+        h = F.relu(self.encoder_fc_h(h))
+        c = F.relu(self.encoder_fc_c(c))
+        return outputs, (h, c)
 
     def forward_decoder(self, inputs, z):
         """
@@ -1046,7 +1047,7 @@ class NetGen(AbstractVAE):
         # Generator: z -> graph
         # text, adj = self.generate_graph(z, temp=temp)
         # text, adj, entropy, cost = self.generate_graph(z, mask, return_entropy=True)
-        text, adj, attentions, penal2 = self.generate_graph(z, h, mask)
+        text, adj, attentions, penal2, c_loss = self.generate_graph(z, h, enc_inputs, mask)
 
         # Graph Encoder: graph -> z'
         z1 = self.forward_graph_encoder(text, adj)
@@ -1059,15 +1060,6 @@ class NetGen(AbstractVAE):
 
         penal1 = torch.distributions.Categorical(probs=attentions).entropy().mean()
 
-        c = attentions[:, 0, :]
-        current_attention = attentions[:, 1, :]
-        c_loss = torch.min(c, current_attention)
-        for i in range(2, self.n_node):
-            c = c + current_attention
-            current_attention = attentions[:, i, :]
-            c_loss = c_loss + torch.min(c, current_attention)
-        c_loss = c_loss.sum(dim=1).mean()
-
         return recon_loss, penal1, penal2, c_loss
 
     def forward_classifier(self, inputs, mask):
@@ -1078,7 +1070,7 @@ class NetGen(AbstractVAE):
         # Generator: z -> graph
         # text, adj = self.generate_graph(z, temp)
         # text, adj = self.generate_graph(z, mask, return_entropy=False)
-        text, adj, _, _ = self.generate_graph(z, h, mask)
+        text, adj, _, _, _ = self.generate_graph(z, h, inputs, mask)
 
         # classifier: graph -> prediction
         x = self.graph_encoder_cls(text, adj)
@@ -1106,30 +1098,38 @@ class NetGen(AbstractVAE):
 
         return self.output_graph(z)
 
-    def generate_graph(self, z, hidden_state, mask):
-        bsize, d_k = z.size()[0], z.size()[2]
-        s = torch.zeros(bsize, 1, d_k).to(self.device)
+    def generate_graph(self, z, hidden_state, inputs, mask):
+        bsize, n, d_k = z.size()
         h, c = hidden_state
-        h = h.view(1, bsize, -1)
-        c = c.view(1, bsize, -1)
-        outputs, atts, states = [], [], []
+
+        s = torch.zeros(bsize, 1, d_k).to(self.device)
+        coverage = torch.zeros(bsize, n).to(self.device)
+        outputs, atts, states, g_emb = [], [], [], []
+        closs = 0
+
         for i in range(self.n_node):
-            s, (h, c) = self.generate_lstm(s, (h, c))
-            # q = s
-            q = self.q_linear(s)
-            k = self.k_linear(z)
-            # v = self.v_linear(z)
-            v = z
-            states.append(s)
-            s, att = self_attention(q, k, v, d_k, mask)
-            outputs.append(s)
-            atts.append(att)
+            _, (h, c) = self.generate_lstm(s, (h, c))
+            x = torch.cat((h, c), dim=-1).view(bsize, 1, -1)
+            c_t, attn_dist, coverage_next = self.attention_network(x, z, mask, coverage)
+            states.append(x)
+            c_t = c_t.unsqueeze(dim=1)
+            outputs.append(c_t)
+            atts.append(attn_dist)
+            closs = closs + torch.sum(torch.min(attn_dist.squeeze(1), coverage), 1).mean()
+            s = c_t
+            coverage = coverage_next
+
+            i_t = torch.bmm(attn_dist, self.word_emb(inputs))
+            g_emb.append(i_t.data)
+
+
         text = torch.cat(outputs, dim=1)
         attentions = torch.cat(atts, dim=1)
         S = torch.cat(states, dim=1)
-        adj, penal = self.generate_adjacency_matrix(S, text)
+        g_emb = torch.cat(g_emb, dim=1)
+        adj, penal = self.generate_adjacency_matrix(S, g_emb)
 
-        return text, adj, attentions, penal
+        return text, adj, attentions, penal, closs
 
     def generate_adjacency_matrix(self, z, text=None):
         # z = torch.cat((z, text), -1)
@@ -1215,13 +1215,13 @@ class NetGen(AbstractVAE):
 
         for epoch in range(1, args.epochs):
 
-            if epoch == 1:
+            if epoch == 100:
                 a=1
             #     alpha = args.alpha
                 beta = args.beta
                 # gamma = args.gamma
 
-            if epoch == 20:
+            if epoch == 200:
                 lam = 0.1
 
             for i, subdata in enumerate([train_iter]):
