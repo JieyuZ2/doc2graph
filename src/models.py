@@ -1116,7 +1116,7 @@ class NetGen(AbstractVAE):
             outputs.append(c_t)
             atts.append(attn_dist)
             closs = closs + torch.sum(torch.min(attn_dist.squeeze(1), coverage), 1).mean()
-            s = c_t
+            s = c_t.data
             coverage = coverage_next
 
             i_t = torch.bmm(attn_dist, self.word_emb(inputs))
