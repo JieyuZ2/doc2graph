@@ -14,19 +14,19 @@ from src.dataset import Dataset, SST_Dataset, DBLP_Dataset, NYnews_Dataset
 def parse_args():
     parser = argparse.ArgumentParser()
     # general options
-    parser.add_argument('--dataset', type=str, default='sst', choices=['sst', 'dblp', 'nyt'])
+    parser.add_argument('--dataset', type=str, default='dblp', choices=['sst', 'dblp', 'nyt'])
     parser.add_argument("--embed_path", type=str, default='')
     parser.add_argument('--model', type=str, default='netgen', choices=['netgen', 'rnnvae', 'rnnvae2', 'rnnae'])
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument("--prefix", type=str, default='', help="prefix use as addition directory")
     parser.add_argument('--suffix', default='', type=str, help='suffix append to log dir')
     parser.add_argument('--log_level', default=20)
-    parser.add_argument('--log_every', type=int, default=1, help='log results every epoch.')
-    parser.add_argument('--save_every', type=int, default=10, help='save learned embedding every epoch.')
+    parser.add_argument('--log_every', type=int, default=5, help='log results every epoch.')
+    parser.add_argument('--save_every', type=int, default=50, help='save learned embedding every epoch.')
 
     # training options
-    parser.add_argument('--epochs', type=int, default=1000)
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--epochs', type=int, default=500)
+    parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--early_stop', type=int, default=0)
     parser.add_argument('--minimal_epoch', type=int, default=500)
@@ -42,12 +42,13 @@ def parse_args():
 
 
     # model options
-    parser.add_argument('--h_dim', type=int, default=50)
+    parser.add_argument('--embed_dim', type=int, default=100)
+    parser.add_argument('--h_dim', type=int, default=100)
     parser.add_argument('--z_dim', type=int, default=100)
-    parser.add_argument('--n_node', type=int, default=5)
+    parser.add_argument('--n_node', type=int, default=10)
     parser.add_argument('--kl_weight', type=float, default=0.1)
-    parser.add_argument('--cls_weight', type=float, default=10.0)
-    parser.add_argument('--alpha', type=float, default=0.1)
+    parser.add_argument('--cls_weight', type=float, default=0.0)
+    parser.add_argument('--alpha', type=float, default=0.01)
     parser.add_argument('--beta', type=float, default=0.1)
     parser.add_argument('--gamma', type=float, default=0.01)
 
@@ -96,20 +97,14 @@ def main(args):
     if args.model == 'rnnvae':
         model = RNNVAE(dataset.n_vocab, args.n_labels, args.h_dim, args.z_dim,
                        pretrained_embeddings=dataset.get_vocab_vectors(), freeze_embeddings=True, device=device)
-    elif args.model == 'rnnvae2':
-        model = RNNVAE2(dataset.n_vocab, args.n_labels, args.h_dim, args.z_dim,
-                       pretrained_embeddings=dataset.get_vocab_vectors(), freeze_embeddings=True, device=device)
-    elif args.model == 'rnnae':
-        model = RNNAE(dataset.n_vocab, args.n_labels, args.h_dim, args.z_dim,
-                        pretrained_embeddings=dataset.get_vocab_vectors(), freeze_embeddings=True, device=device)
     elif args.model == 'netgen':
-        model = NetGen(args.n_node, dataset.n_vocab, args.n_labels, args.h_dim, args.z_dim,
-                       pretrained_embeddings=dataset.get_vocab_vectors(), freeze_embeddings=False, device=device)
+        model = NetGen(args.n_node, dataset.n_vocab, args.n_labels, args.embed_dim, args.h_dim, args.z_dim,
+                       pretrained_embeddings=None, freeze_embeddings=False, device=device)
     else:
         raise NotImplementedError(f'the model {args.model} is not implemented!')
 
     try:
-        model.train_model(args, dataset)
+        model.train_model(args, dataset, logger)
     except KeyboardInterrupt:
         save_model(model, logger, args.log_dir)
         exit('KeyboardInterrupt!')

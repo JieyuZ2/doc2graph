@@ -1,5 +1,5 @@
-import math
-import time, random
+import os
+import time, random, pickle, math, json
 from itertools import chain, combinations
 import numpy as np
 from typing import *
@@ -81,12 +81,12 @@ class Attention(nn.Module):
         att_features = att_features + coverage_feature
 
         e = F.tanh(att_features) # B * t_k x 2*hidden_dim
-        scores = self.v(e).squeeze() # B * t_k x 1
+        scores = self.v(e).squeeze()
+        scores = scores.masked_fill(enc_padding_mask == 0, -1e9)# B * t_k x 1
         # scores = scores.view(-1, t_k)  # B x t_k
 
-        attn_dist_ = F.softmax(scores, dim=1)*enc_padding_mask.float() # B x t_k
-        normalization_factor = attn_dist_.sum(1, keepdim=True)
-        attn_dist = attn_dist_ / normalization_factor
+        attn_dist_ = F.softmax(scores, dim=1) # B x t_k
+        attn_dist = attn_dist_
 
         attn_dist = attn_dist.unsqueeze(1)  # B x 1 x t_k
         c_t = torch.bmm(attn_dist, encoder_outputs)  # B x 1 x n
@@ -95,72 +95,6 @@ class Attention(nn.Module):
         coverage = coverage + attn_dist.squeeze(1)
 
         return c_t, attn_dist, coverage
-
-
-from enum import IntEnum
-
-
-class Dim(IntEnum):
-    batch = 0
-    seq = 1
-    feature = 2
-
-
-class NaiveLSTM(nn.Module):
-    def __init__(self, input_sz: int, hidden_sz: int):
-        super().__init__()
-        self.input_size = input_sz
-        self.hidden_size = hidden_sz
-        # input gate
-        self.W_ii = Parameter(torch.Tensor(input_sz, hidden_sz))
-        self.W_hi = Parameter(torch.Tensor(hidden_sz, hidden_sz))
-        self.b_i = Parameter(torch.Tensor(hidden_sz))
-        # forget gate
-        self.W_if = Parameter(torch.Tensor(input_sz, hidden_sz))
-        self.W_hf = Parameter(torch.Tensor(hidden_sz, hidden_sz))
-        self.b_f = Parameter(torch.Tensor(hidden_sz))
-        # ???
-        self.W_ig = Parameter(torch.Tensor(input_sz, hidden_sz))
-        self.W_hg = Parameter(torch.Tensor(hidden_sz, hidden_sz))
-        self.b_g = Parameter(torch.Tensor(hidden_sz))
-        # output gate
-        self.W_io = Parameter(torch.Tensor(input_sz, hidden_sz))
-        self.W_ho = Parameter(torch.Tensor(hidden_sz, hidden_sz))
-        self.b_o = Parameter(torch.Tensor(hidden_sz))
-
-        self.init_weights()
-
-    def init_weights(self):
-        for p in self.parameters():
-            if p.data.ndimension() >= 2:
-                nn.init.xavier_uniform_(p.data)
-            else:
-                nn.init.zeros_(p.data)
-
-    def forward(self, x: torch.Tensor,
-                init_states: Optional[Tuple[torch.Tensor]] = None
-                ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Assumes x is of shape (batch, sequence, feature)"""
-        bs, seq_sz, _ = x.size()
-        hidden_seq = []
-        if init_states is None:
-            h_t, c_t = torch.zeros(self.hidden_size).to(x.device), torch.zeros(self.hidden_size).to(x.device)
-        else:
-            h_t, c_t = init_states
-        for t in range(seq_sz):  # iterate over the time steps
-            x_t = x[:, t, :]
-            i_t = torch.sigmoid(x_t @ self.W_ii + h_t @ self.W_hi + self.b_i)
-            f_t = torch.sigmoid(x_t @ self.W_if + h_t @ self.W_hf + self.b_f)
-            g_t = torch.tanh(x_t @ self.W_ig + h_t @ self.W_hg + self.b_g)
-            o_t = torch.sigmoid(x_t @ self.W_io + h_t @ self.W_ho + self.b_o)
-            c_t = f_t * c_t + i_t * g_t
-            h_t = o_t * torch.tanh(c_t)
-            hidden_seq.append(h_t.unsqueeze(Dim.batch))
-        hidden_seq = torch.cat(hidden_seq, dim=Dim.batch)
-        # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
-        hidden_seq = hidden_seq.transpose(Dim.batch, Dim.seq).contiguous()
-        return hidden_seq, (h_t, c_t)
-
 
 
 class GraphConvolution(nn.Module):
@@ -200,7 +134,7 @@ class GraphConvolution(nn.Module):
 
 
 class AbstractVAE(nn.Module):
-    def __init__(self, n_vocab, n_labels, h_dim, p_word_dropout=0.3, unk_idx=0, pad_idx=1, start_idx=2, eos_idx=3,
+    def __init__(self, n_vocab, n_labels, embed_dim, h_dim, p_word_dropout=0.3, unk_idx=0, pad_idx=1, start_idx=2, eos_idx=3,
                  pretrained_embeddings=None, freeze_embeddings=False, device=False):
         super(AbstractVAE, self).__init__()
         self.UNK_IDX = unk_idx
@@ -219,8 +153,8 @@ class AbstractVAE(nn.Module):
         Word embeddings layer
         """
         if pretrained_embeddings is None:
-            self.emb_dim = h_dim
-            self.word_emb = nn.Embedding(n_vocab, h_dim, self.PAD_IDX)
+            self.emb_dim = embed_dim
+            self.word_emb = nn.Embedding(n_vocab, embed_dim, self.PAD_IDX)
         else:
             self.emb_dim = pretrained_embeddings.size(1)
             self.word_emb = nn.Embedding(n_vocab, self.emb_dim, self.PAD_IDX)
@@ -356,7 +290,7 @@ class AbstractVAE(nn.Module):
         else:
             return outputs
 
-    def word_dropout(self, inputs):
+    def word_dropout(self, inputs, padding_mask):
         """
         Do word dropout: with prob `p_word_dropout`, set the word to '<unk>'.
         """
@@ -372,6 +306,7 @@ class AbstractVAE(nn.Module):
         )
 
         mask = mask.to(self.device)
+        mask = mask * padding_mask.byte()
 
         # Set to <unk>
         data[mask] = self.UNK_IDX
@@ -881,9 +816,9 @@ class RNNAE(AbstractVAE):
 
 
 class NetGen(AbstractVAE):
-    def __init__(self, n_node, n_vocab, n_labels, h_dim, z_dim, p_word_dropout=0.3, unk_idx=0, pad_idx=1, start_idx=2,
+    def __init__(self, n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout=0.5, unk_idx=0, pad_idx=1, start_idx=2,
                  eos_idx=3, pretrained_embeddings=None, freeze_embeddings=False, device=False):
-        super(NetGen, self).__init__(n_vocab, n_labels, h_dim, p_word_dropout, unk_idx, pad_idx, start_idx, eos_idx,
+        super(NetGen, self).__init__(n_vocab, n_labels, embed_dim, h_dim, p_word_dropout, unk_idx, pad_idx, start_idx, eos_idx,
                                      pretrained_embeddings, freeze_embeddings, device)
 
         # self.z_dim = n_node * z_dim
@@ -904,11 +839,12 @@ class NetGen(AbstractVAE):
         """
         Decoder is GRU with `z` appended at its inputs
         """
-        self.decoder_h_linear = nn.Linear(self.n_node * self.node_dim, h_dim)
-        self.decoder_c_linear = nn.Linear(self.n_node * self.node_dim, h_dim)
-        self.decoder = nn.LSTM(self.emb_dim, h_dim, dropout=0.3, batch_first=True)
+        self.decoder_h_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
+        self.decoder_c_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
+        self.decoder_d_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
+        self.decoder = nn.LSTM(self.emb_dim + z_dim, z_dim, num_layers=1, dropout=0.3, batch_first=True)
         # self.decoder_fc = nn.Linear(n_node * self.emb_dim, n_vocab)
-        self.decoder_fc = nn.Linear(h_dim, self.n_vocab)
+        self.decoder_fc = nn.Linear(z_dim, self.n_vocab)
 
         """
         Generator 
@@ -921,14 +857,13 @@ class NetGen(AbstractVAE):
             nn.Linear(self.node_dim // 2, self.node_dim // 4)
         )
 
-
         """
         Graph Encoder is GCN with pooling layer
         """
         self.graph_encoder = GraphConvolution(self.node_dim, self.node_dim, bias=False)
         self.graph_encoder_fc = nn.Linear(2 * self.node_dim, self.node_dim, bias=False)
         self.decoder_ = nn.ModuleList([
-            self.decoder, self.decoder_fc, self.decoder_c_linear, self.decoder_h_linear,
+            self.decoder, self.decoder_fc, self.decoder_c_linear, self.decoder_h_linear, self.decoder_d_linear,
             self.attention_network,
             self.generate_lstm, self.generate_adj,
             self.graph_encoder, self.graph_encoder_fc
@@ -942,6 +877,7 @@ class NetGen(AbstractVAE):
         self.classifier = nn.Sequential(
             nn.Linear(self.node_dim * self.n_node, self.emb_dim),
             nn.ReLU(),
+            nn.Dropout(0.5),
             nn.Linear(self.emb_dim, self.n_labels)
         )
         self.classifier_ = nn.ModuleList([
@@ -957,15 +893,40 @@ class NetGen(AbstractVAE):
 
         self.classifier_params = filter(lambda p: p.requires_grad, self.classifier_.parameters())
 
-        self.vae_params = chain(
+        self.ae_params = chain(
             self.word_emb.parameters(), self.encoder_.parameters(), self.decoder_.parameters()
         )
-        self.vae_params = filter(lambda p: p.requires_grad, self.vae_params)
+        self.ae_params = filter(lambda p: p.requires_grad, self.ae_params)
 
         """
         Use GPU if set
         """
         self.to(self.device)
+
+    def word_dropout(self, inputs):
+        """
+        Do word dropout: with prob `p_word_dropout`, set the word to '<unk>'.
+        """
+        if isinstance(inputs, Variable):
+            data = inputs.data.clone()
+        else:
+            data = inputs.clone()
+
+        # Sample masks: elems with val 1 will be set to <unk>
+        mask = torch.from_numpy(
+            np.random.binomial(1, p=self.p_word_dropout, size=tuple(data.size()))
+                .astype('uint8')
+        )
+
+        padding_mask = self.dataset.create_padding_mask(inputs=inputs, device=self.device, padding=self.PAD_IDX)
+
+        mask = mask.to(self.device)
+        mask = mask * padding_mask.byte()
+
+        # Set to <unk>
+        data[mask] = self.UNK_IDX
+
+        return Variable(data)
 
     def forward_graph_encoder(self, inputs, adj):
         # x = F.relu(self.graph_encoder(input, adj))
@@ -995,25 +956,44 @@ class NetGen(AbstractVAE):
         c = F.relu(self.encoder_fc_c(c))
         return outputs, (h, c)
 
-    def forward_decoder(self, inputs, z):
+    def forward_decoder(self, inputs, z, teacher_force=False):
         """
         Inputs must be embeddings: seq_len x mbsize
         """
         dec_inputs = self.word_dropout(inputs)
+        bsize, length = dec_inputs.size()
 
         # 1 x mbsize x z_dim
         init_h = z.unsqueeze(0)
-        c = self.decoder_c_linear(init_h)
-        h = self.decoder_h_linear(init_h)
-        inputs_emb = self.word_emb(dec_inputs)  # seq_len x mbsize x emb_dim
-        # inputs_emb = torch.cat([inputs_emb, init_h.repeat(seq_len, 1, 1)], 2)
-        outputs, _ = self.decoder(inputs_emb, (h, c))
-        y = self.decoder_fc(outputs)
-        # y = y @ self.word_emb.weight.t() #.data.t()
+        c = self.decoder_c_linear(init_h).relu()
+        h = self.decoder_h_linear(init_h).relu()
+        d = self.decoder_d_linear(init_h).relu().transpose(1, 0)
+
+        if teacher_force:
+            inputs_emb = self.word_emb(dec_inputs)  # seq_len x mbsize x emb_dim
+            inputs_emb = torch.cat([inputs_emb, d.repeat(1, length, 1)], -1)
+            # inputs_emb = torch.cat([inputs_emb, init_h.repeat(seq_len, 1, 1)], 2)
+            outputs, _ = self.decoder(inputs_emb, (h, c))
+            y = self.decoder_fc(outputs)
+            # y = y @ self.word_emb.weight.t() #.data.t()
+        else:
+            start_word = torch.LongTensor([self.START_IDX]).repeat(bsize).view(-1, 1)
+            start_word = start_word.to(self.device)
+            emb = self.word_emb(start_word)
+            emb = torch.cat([emb, d], -1)
+            ys = []
+            for i in range(length):
+                output, (h, c) = self.decoder(emb, (h, c))
+                output = self.decoder_fc(output)
+                ys.append(output)
+                y = F.softmax(output, dim=2)
+                emb = (y @ self.word_emb.weight).data
+                emb = torch.cat([emb, d], -1)
+            y = torch.cat(ys, dim=1)
 
         return y
 
-    def forward(self, sentence, mask, temp=1):
+    def forward(self, sentence, mask, classifier):
         """
         Params:
         -------
@@ -1028,15 +1008,8 @@ class NetGen(AbstractVAE):
 
         mbsize = sentence.size(0)
 
-        # sentence: '<start> I want to fly <eos>'
-        # enc_inputs: '<start> I want to fly <eos>'
-        # dec_inputs: '<start> I want to fly <eos>'
-        # dec_targets: 'I want to fly <eos> <pad>'
         enc_inputs = sentence
         dec_inputs = sentence
-
-        # pad_mask = torch.zeros(mbsize, 1).to(self.device)
-        # padding_mask = torch.cat([padding_mask[:, 1:].float(), pad_mask], dim=1)
 
         pad_words = torch.LongTensor([self.PAD_IDX]).repeat(mbsize, 1).to(self.device)
         dec_targets = torch.cat([sentence[:, 1:], pad_words], dim=1)
@@ -1060,7 +1033,17 @@ class NetGen(AbstractVAE):
 
         penal1 = torch.distributions.Categorical(probs=attentions).entropy().mean()
 
-        return recon_loss, penal1, penal2, c_loss
+        if classifier:
+            # classifier: graph -> prediction
+            x = self.graph_encoder_cls(text, adj)
+            x = F.relu(self.graph_encoder_cls_fc(torch.cat((x, text), -1)))
+            # x = text
+            x = x.view(-1, self.node_dim * self.n_node)
+            outputs = self.classifier(x)
+
+            return recon_loss, outputs, penal1, penal2, c_loss
+        else:
+            return recon_loss, penal1, penal2, c_loss
 
     def forward_classifier(self, inputs, mask):
 
@@ -1079,24 +1062,6 @@ class NetGen(AbstractVAE):
         x = x.view(-1, self.node_dim * self.n_node)
         outputs = self.classifier(x)
         return outputs
-
-    def output_graph(self, z):
-        adj = self.generate_adjacency_matrix(z).cpu().float()
-        word_idx = self.generate_word(z).cpu().int()
-        return adj, word_idx
-
-    def output_graph_from_text(self, text):
-        flag = 0
-        if self.training:
-            self.eval()
-            flag = 1
-
-        z, = self.forward_encoder(text)
-
-        if flag:
-            self.train()
-
-        return self.output_graph(z)
 
     def generate_graph(self, z, hidden_state, inputs, mask):
         bsize, n, d_k = z.size()
@@ -1161,46 +1126,15 @@ class NetGen(AbstractVAE):
 
         return adj, penal
 
-    def generate_word(self, z):
-        outputs = self.generate_text(z).view(-1)
-        word_idx = torch.argmax(F.softmax(outputs, dim=0), dim=0)
-        return word_idx
-
-    def generate_soft_node_embed(self, z, mask=None, temp=1.0, return_entropy=True):
-        """
-        Sample single soft embedded sentence from p(x|z) and temperature.
-        Soft embeddings are calculated as weighted average of word_emb
-        according to p(x|z).
-        """
-
-        outputs = self.generate_text(z)
-        outputs = outputs @ self.word_emb.weight.t()
-        if mask is not None:
-            outputs = outputs.masked_fill(mask.unsqueeze(1) == 0, -float('inf'))
-
-        # Sample softmax with temperature
-        y = F.softmax(outputs / temp, dim=2)
-
-        # Take expectation of embedding given output prob -> soft embedding
-        emb = torch.matmul(y, self.word_emb.weight)
-
-        if return_entropy:
-            # Calculate entropy for penalty
-            entropy = torch.distributions.Categorical(probs=y).entropy().mean()
-            # cost = self.estimate_cost(y)
-            cost = torch.FloatTensor([0.0])
-            return emb, entropy, cost
-        else:
-            return emb
-
-    def train_model(self, args, dataset):
+    def train_model(self, args, dataset, logger):
         """train the whole network"""
         self.train()
+        self.dataset = dataset
 
         alpha = 0
         beta = 0
         gamma = 0
-        lam = 0
+        lam = args.cls_weight
 
         trainer = optim.Adam(self.parameters(), lr=args.lr)
         criterion_cls = nn.CrossEntropyLoss().to(self.device)
@@ -1215,28 +1149,23 @@ class NetGen(AbstractVAE):
 
         for epoch in range(1, args.epochs):
 
-            if epoch == 100:
-                a=1
-            #     alpha = args.alpha
+            if epoch == 1:
+                alpha = args.alpha
                 beta = args.beta
-                # gamma = args.gamma
-
-            if epoch == 200:
-                lam = 0.1
 
             for i, subdata in enumerate([train_iter]):
                 for batch in iter(subdata):
-                    inputs, labels = batch.text, batch.label
-                    inputs = inputs.t()
-                    mask = dataset.create_mask(inputs, device=self.device)
-                    recon_loss, penal1, penal2, closs = self.forward(inputs, mask=mask)
+                    inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+                    # mask = dataset.create_mask(inputs, device=self.device)
 
-                    if i == 0:
-                        outputs = self.forward_classifier(inputs, mask)
+                    if lam != 0 and i == 0:
+                        recon_loss, outputs, penal1, penal2, closs = self.forward(inputs, mask=mask, classifier=True)
                         loss_cls = criterion_cls(outputs, labels)
                         list_loss_cls.append(loss_cls.item())
                         loss_vae = recon_loss + lam * loss_cls + alpha * penal1 + gamma * penal2 + beta * closs
                     else:
+
+                        recon_loss, penal1, penal2, closs = self.forward(inputs, mask=mask, classifier=False)
                         loss_vae = recon_loss + alpha * penal1 + gamma * penal2 + beta * closs
 
                     if torch.isnan(loss_vae):
@@ -1248,7 +1177,7 @@ class NetGen(AbstractVAE):
 
                     trainer.zero_grad()
                     loss_vae.backward()
-                    # grad_norm = torch.nn.utils.clip_grad_norm_(self.decoder_params, 5)
+                    # grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), 10)
                     trainer.step()
 
             if epoch % args.log_every == 0:
@@ -1260,31 +1189,45 @@ class NetGen(AbstractVAE):
                 avr_cls = np.mean(list_loss_cls)
                 list_loss_recon, list_loss_penal1, list_loss_penal2, list_loss_closs = [], [], [], []
                 list_loss_cls = []
-                print(f'Epoch-{epoch}; loss_recon: {avr_loss_recon:.4f}; loss_cls: {avr_cls:.4f}; penal1: {avr_loss_penal1:.4f}; '
+                logger.info(f'Epoch-{epoch}; loss_recon: {avr_loss_recon:.4f}; loss_cls: {avr_cls:.4f}; penal1: {avr_loss_penal1:.4f}; '
                       f' penal2: {avr_loss_penal2:.4f}; avr_closs: {avr_closs:.4f}; duration: {round(duration)}')
 
-                # val_acc, test_acc = self.train_model_classifier(args, dataset, current_temp)
-                train_acc = self.test(dataset, train_iter)
-                val_acc = self.test(dataset, val_iter)
-                test_acc = self.test(dataset, test_iter)
-                print(f'Train Acc: {train_acc:.4f}; Valid Acc: {val_acc:.4f}; Test Acc: {test_acc:.4f}; Best Acc: {best_test_acc:.4f} @ {best_iter}')
+                if lam == 0:
+                    train_acc, val_acc, test_acc = self.train_model_classifier(args, dataset)
+                else:
+                    train_acc = self.test(dataset, train_iter)
+                    val_acc = self.test(dataset, val_iter)
+                    test_acc = self.test(dataset, test_iter)
 
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     best_test_acc = test_acc
                     best_iter = epoch
                     patience = 0
+                    graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='test')
+                    graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='val')
+                    graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='train')
                 else:
                     if epoch > args.minimal_epoch:
                         patience += args.log_every
 
+                logger.info(f'Train Acc: {train_acc:.4f}; Valid Acc: {val_acc:.4f}; Test Acc: {test_acc:.4f}; Best Acc: {best_test_acc:.4f} @ {best_iter}')
+
                 if args.early_stop and patience > args.patience:
                     break
 
-        print(f'Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_iter}')
+            if epoch % args.save_every == 0:
+                graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'),
+                                          save_name='test')
+                graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'),
+                                          save_name='val')
+                graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'),
+                                          save_name='train')
+
+        logger.info(f'Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_iter}')
         return best_val_acc, best_test_acc
 
-    def train_model_classifier(self, args, dataset, temp=1.0):
+    def train_model_classifier(self, args, dataset):
         """train the whole network"""
         self.train()
 
@@ -1299,16 +1242,14 @@ class NetGen(AbstractVAE):
         patience = 0
         log_every = 5
         list_loss_cls = []
-        best_val_acc, best_test_acc, best_iter = 0, 0, 0
+        best_train_acc, best_val_acc, best_test_acc, best_iter = 0, 0, 0, 0
         train_start_time = time.time()
 
         train_iter = dataset.build_train_iter(args.eval_batch_size, self.device)
 
         for epoch in range(1, args.eval_epochs):
             for batch in iter(train_iter):
-                inputs, labels = batch.text, batch.label
-                inputs = inputs.t()
-                mask = dataset.create_mask(inputs, device=self.device)
+                inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
 
                 """ Update classifier """
                 outputs = self.forward_classifier(inputs, mask)
@@ -1327,10 +1268,12 @@ class NetGen(AbstractVAE):
                 val_iter, test_iter = dataset.build_test_iter(args.batch_size, self.device)
                 val_acc = self.test(dataset, val_iter)
                 test_acc = self.test(dataset, test_iter)
+                train_acc = self.test(dataset, train_iter)
 
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     best_test_acc = test_acc
+                    best_train_acc = train_acc
                     best_iter = epoch
                     patience = 0
                 else:
@@ -1345,22 +1288,58 @@ class NetGen(AbstractVAE):
             #           f' duration: {duration:.2f}')
 
         # print(f'Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ iter {best_iter}')
-        return best_val_acc, best_test_acc
+        return best_train_acc, best_val_acc, best_test_acc
 
     def test(self, dataset, data_iter):
         self.eval()
         total_accuracy = []
         with torch.no_grad():
             for batch in iter(data_iter):
-                inputs, labels = batch.text, batch.label
-                inputs = inputs.t()
-                mask = dataset.create_mask(inputs, device=self.device)
+                inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
                 outputs = self.forward_classifier(inputs, mask)
                 accuracy = (outputs.argmax(1) == labels).float().mean().item()
                 total_accuracy.append(accuracy)
         acc = sum(total_accuracy) / len(total_accuracy)
         self.train()
         return acc
+
+    def output_graph(self, dataset, data_iter, save_path=None, save_name=''):
+        self.eval()
+        input_list, adj_list, word_list = [], [], []
+        with torch.no_grad():
+            for batch in iter(data_iter):
+                inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+
+                z, h = self.forward_encoder(inputs)
+                text, adj, attentions, _, _ = self.generate_graph(z, h, inputs, mask)
+                chosen = attentions.argmax(dim=-1).cpu().numpy()
+
+                for ins, ch in zip(inputs.cpu().numpy(), chosen):
+                    ins = [dataset.idx2word(i) for i in ins if i != self.PAD_IDX]
+                    words = [ins[i] for i in ch]
+                    input_list.append(' '.join(ins))
+                    word_list.append(words)
+                adj_list.append(adj.cpu().numpy())
+        adj_list = np.concatenate(adj_list, axis=0)
+        self.train()
+
+        if save_path:
+            if not os.path.exists(save_path):
+                os.mkdir(save_path)
+            with open(os.path.join(save_path, f'{save_name}.pickle'), 'wb') as handle:
+                graph = {
+                    'adj_list': adj_list,
+                    'word_list': word_list,
+                    'input_list': input_list
+                }
+                pickle.dump(graph, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            with open(os.path.join(save_path, f'{save_name}.json'), 'w') as handle:
+                graph = {}
+                for idx, (ins, words) in enumerate(zip(input_list, word_list)):
+                    graph[idx] = {'doc':ins, 'keywords':words}
+                json.dump(graph, handle, indent=4)
+
+        return input_list, word_list, adj_list
 
 
 class NetGen1(AbstractVAE):
@@ -1881,7 +1860,7 @@ class NetGen1(AbstractVAE):
             q = self.q_linear(s)
             k = self.k_linear(z)
             v = self.v_linear(z)
-            s, att = attention(q, k, v, d_k, mask)
+            s, att = self_attention(q, k, v, d_k, mask)
             outputs.append(s)
             atts.append(att)
         text = torch.cat(outputs, dim=1)

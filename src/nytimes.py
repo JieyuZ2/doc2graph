@@ -2,6 +2,10 @@ import os
 import glob
 import io
 import random
+from string import punctuation as punctuation_
+from nltk.corpus import stopwords
+stopwords_ = stopwords.words('english')
+ignore_ = stopwords_ + list(punctuation_)
 
 import torchtext.data as data
 dir_path = os.path.dirname(os.path.realpath(__file__))

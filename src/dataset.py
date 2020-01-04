@@ -1,4 +1,8 @@
 import os
+from collections import defaultdict
+from string import punctuation as punctuation_
+import nltk
+from nltk.corpus import stopwords
 import torch
 from torchtext import data, datasets
 from torchtext.vocab import Vectors, GloVe
@@ -6,11 +10,20 @@ from torchtext.vocab import Vectors, GloVe
 from src.nytimes import NYnews
 from src.dblp import DBLP
 
+stopwords_ = set(stopwords.words('english'))
+ignore_ = list(stopwords_) + list(punctuation_)
+
 
 class Dataset:
     def __init__(self, emb_dim):
-        self.TEXT.build_vocab(self.train, vectors=GloVe('6B', dim=emb_dim))
+        self.TEXT.build_vocab(self.train)
         self.LABEL.build_vocab(self.train)
+        self.MASK.build_vocab(self.train)
+        self.MASK.vocab.stoi = defaultdict(lambda:1)
+        for s in [self.MASK.unk_token, self.MASK.pad_token, self.MASK.init_token, self.MASK.eos_token]:
+            self.MASK.vocab.stoi[s] = 0
+        for s in ignore_:
+            self.MASK.vocab.stoi[s] = 0
 
         self.n_vocab = len(self.TEXT.vocab.itos)
         self.n_labels = len(self.LABEL.vocab.itos)
@@ -22,8 +35,12 @@ class Dataset:
         mask[inputs == padding] = 0
         return mask
 
-    def create_mask(self, inputs, device, except_list=[0, 1, 2, 3]):
+    def create_mask(self, inputs, device, except_list=[0, 1, 2, 3], stopwords=True, punctuation=True):
         mask = torch.ones_like(inputs).to(device)
+        if stopwords:
+            except_list += [self.TEXT.vocab.stoi[i] for i in stopwords_]
+        if punctuation:
+            except_list += [self.TEXT.vocab.stoi[i] for i in punctuation_]
         for ele in except_list:
             mask[inputs == ele] = 0
         return mask
@@ -56,6 +73,9 @@ class Dataset:
             else:
                 yield batch.text, batch.label
 
+    def idx2word(self, idx):
+        return self.TEXT.vocab.itos[idx]
+
     def idxs2sentence(self, idxs):
         return ' '.join([self.TEXT.vocab.itos[i] for i in idxs])
 
@@ -65,7 +85,7 @@ class Dataset:
 
 class NYnews_Dataset(Dataset):
     def __init__(self, emb_dim=100):
-        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
+        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy', stop_words=stopwords_)
         self.LABEL = data.Field(sequential=False, unk_token=None)
 
         f = lambda ex: len(ex.text) >= 10 and len(ex.text) <= 500
@@ -77,19 +97,22 @@ class NYnews_Dataset(Dataset):
 
 class DBLP_Dataset(Dataset):
     def __init__(self, emb_dim=100):
-        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
+        # remove = stopwords_.union(punctuation_)
+        remove = set()
+        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy', stop_words=remove)
         self.LABEL = data.Field(sequential=False, unk_token=None)
+        self.MASK = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy', stop_words=remove)
 
         f = lambda ex: len(ex.text) >= 10 and len(ex.text) <= 200
 
-        self.train, self.val, self.test = DBLP.splits(self.TEXT, self.LABEL, filter_pred=f)
+        self.train, self.val, self.test = DBLP.splits(self.TEXT, self.LABEL, self.MASK, filter_pred=f)
 
         super(DBLP_Dataset, self).__init__(emb_dim)
 
 
 class SST_Dataset(Dataset):
     def __init__(self, emb_dim=100):
-        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
+        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy', stop_words=stopwords_)
         self.LABEL = data.Field(sequential=False, unk_token=None)
 
         # Only take sentences with length <= 15
