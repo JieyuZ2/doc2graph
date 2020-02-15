@@ -8,21 +8,22 @@ import matplotlib.pyplot as plt
 
 from src.utils import *
 from src.models import *
-from src.dataset import Dataset, SST_Dataset, DBLP_Dataset, NYnews_Dataset
+from src.dataset import Yelp_Dataset, DBLP_Dataset, NYnews_Dataset
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     # general options
-    parser.add_argument('--dataset', type=str, default='dblp', choices=['sst', 'dblp', 'nyt'])
+    parser.add_argument('--dataset', type=str, default='dblp', choices=['yelp', 'dblp', 'nyt'])
     parser.add_argument("--embed_path", type=str, default='')
-    parser.add_argument('--model', type=str, default='netgen', choices=['netgen', 'rnnvae', 'rnnvae2', 'rnnae'])
+    parser.add_argument('--model', type=str, default='netgen1', choices=['netgen', 'rnnvae', 'netgen1', 'rnnae'])
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument("--prefix", type=str, default='', help="prefix use as addition directory")
     parser.add_argument('--suffix', default='', type=str, help='suffix append to log dir')
     parser.add_argument('--log_level', default=20)
     parser.add_argument('--log_every', type=int, default=5, help='log results every epoch.')
     parser.add_argument('--save_every', type=int, default=50, help='save learned embedding every epoch.')
+    parser.add_argument('--tag', type=str, default='')
 
     # training options
     parser.add_argument('--epochs', type=int, default=500)
@@ -48,9 +49,10 @@ def parse_args():
     parser.add_argument('--n_node', type=int, default=10)
     parser.add_argument('--kl_weight', type=float, default=0.1)
     parser.add_argument('--cls_weight', type=float, default=0.0)
-    parser.add_argument('--alpha', type=float, default=0.01)
-    parser.add_argument('--beta', type=float, default=0.1)
-    parser.add_argument('--gamma', type=float, default=0.01)
+    parser.add_argument('--alpha', type=float, default=0.01, help='p1')
+    parser.add_argument('--beta', type=float, default=0.1, help='closs')
+    parser.add_argument('--gamma', type=float, default=0.01, help='p2')
+    parser.add_argument('--theta', type=float, default=0.0, help='lloss')
 
     return parser.parse_args()
 
@@ -84,7 +86,7 @@ def main(args):
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
     dataset_map = {
-        'sst': SST_Dataset,
+        'yelp': Yelp_Dataset,
         'dblp': DBLP_Dataset,
         'nyt': NYnews_Dataset
     }
@@ -92,11 +94,12 @@ def main(args):
     args.n_labels = dataset.n_labels
 
     logger = init_logger(args)
+    logger.info(f'[TAG]: {args.tag}')
     print_config(args, logger)
 
-    if args.model == 'rnnvae':
-        model = RNNVAE(dataset.n_vocab, args.n_labels, args.h_dim, args.z_dim,
-                       pretrained_embeddings=dataset.get_vocab_vectors(), freeze_embeddings=True, device=device)
+    if args.model == 'netgen1':
+        model = NetGen1(args.n_node, dataset.n_vocab, args.n_labels, args.embed_dim, args.h_dim, args.z_dim,
+                       pretrained_embeddings=None, freeze_embeddings=False, device=device)
     elif args.model == 'netgen':
         model = NetGen(args.n_node, dataset.n_vocab, args.n_labels, args.embed_dim, args.h_dim, args.z_dim,
                        pretrained_embeddings=None, freeze_embeddings=False, device=device)

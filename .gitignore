@@ -1,5 +1,6 @@
 #data
 ./data
+./log
 ./src/log
 ./src/.data
 ./src/.vector_cache

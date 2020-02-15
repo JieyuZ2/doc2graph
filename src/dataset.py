@@ -9,6 +9,7 @@ from torchtext.vocab import Vectors, GloVe
 
 from src.nytimes import NYnews
 from src.dblp import DBLP
+from src.yelp import Yelp
 
 stopwords_ = set(stopwords.words('english'))
 ignore_ = list(stopwords_) + list(punctuation_)
@@ -85,23 +86,35 @@ class Dataset:
 
 class NYnews_Dataset(Dataset):
     def __init__(self, emb_dim=100):
-        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy', stop_words=stopwords_)
+        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
         self.LABEL = data.Field(sequential=False, unk_token=None)
+        self.MASK = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
 
         f = lambda ex: len(ex.text) >= 10 and len(ex.text) <= 500
 
-        self.train, self.val, self.test = NYnews.splits(self.TEXT, self.LABEL, filter_pred=f)
+        self.train, self.val, self.test = NYnews.splits(self.TEXT, self.LABEL, self.MASK, filter_pred=f)
 
         super(NYnews_Dataset, self).__init__(emb_dim)
 
 
+class Yelp_Dataset(Dataset):
+    def __init__(self, emb_dim=100):
+        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
+        self.LABEL = data.Field(sequential=False, unk_token=None)
+        self.MASK = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
+
+        f = lambda ex: len(ex.text) >= 10 and len(ex.text) <= 200
+
+        self.train, self.val, self.test = DBLP.splits(self.TEXT, self.LABEL, self.MASK, filter_pred=f)
+
+        super(Yelp_Dataset, self).__init__(emb_dim)
+
+
 class DBLP_Dataset(Dataset):
     def __init__(self, emb_dim=100):
-        # remove = stopwords_.union(punctuation_)
-        remove = set()
-        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy', stop_words=remove)
+        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
         self.LABEL = data.Field(sequential=False, unk_token=None)
-        self.MASK = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy', stop_words=remove)
+        self.MASK = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
 
         f = lambda ex: len(ex.text) >= 10 and len(ex.text) <= 200
 
@@ -112,15 +125,16 @@ class DBLP_Dataset(Dataset):
 
 class SST_Dataset(Dataset):
     def __init__(self, emb_dim=100):
-        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy', stop_words=stopwords_)
+        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
         self.LABEL = data.Field(sequential=False, unk_token=None)
+        self.MASK = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
 
         # Only take sentences with length <= 15
         # f = lambda ex: ex.label != 'neutral' and len(ex.text) >= 20
         f = lambda ex: len(ex.text) >= 10 and len(ex.text) <= 100
 
-        self.train, self.val, self.test = datasets.SST.splits(
-            self.TEXT, self.LABEL, fine_grained=False, train_subtrees=False, filter_pred=f
+        self.train, self.val, self.test = SST.splits(
+            self.TEXT, self.LABEL, self.MASK, fine_grained=False, train_subtrees=False, filter_pred=f
         )
 
         super(SST_Dataset, self).__init__(emb_dim)

@@ -30,7 +30,7 @@ class DBLP(data.Dataset):
         super(DBLP, self).__init__(examples, fields, **kwargs)
 
     @classmethod
-    def splits(cls, text_field, label_field, mask_field, root=parent_path+'/data/processed_dblp.txt', split_ratio=(0.8, 0.1), **kwargs):
+    def splits(cls, text_field, label_field, mask_field, root=parent_path+'/data/dblp.txt', split_ratio=(0.8, 0.1), **kwargs):
         raw_data = []
 
         with open(root, 'r') as f:
@@ -38,8 +38,6 @@ class DBLP(data.Dataset):
                     label, text = line.strip().split('\t ')
                     label = int(label)
                     raw_data.append((label, text))
-
-        random.shuffle(raw_data)
 
         train_sample_num = round(len(raw_data) * split_ratio[0])
         val_sample_num = round(len(raw_data) * split_ratio[1]) + train_sample_num
