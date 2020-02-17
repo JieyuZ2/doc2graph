@@ -53,7 +53,7 @@ def init_logger(args):
         base = os.path.join('log', args.prefix)
         log_dir = os.path.join(base, args.suffix)
     else:
-        tag = f'{args.dataset}_{args.tag}_'
+        tag = f'{args.dataset}_{args.model}_{args.tag}_'
         comment = args.suffix if args.suffix else datetime.now().strftime('%b_%d_%H-%M-%S')
         log_dir = os.path.join('log', tag + comment)
     args.log_dir = log_dir

@@ -189,10 +189,10 @@ class Discriminator(nn.Module):
         return logits
 
 
-class AbstractVAE(nn.Module):
-    def __init__(self, n_vocab, n_labels, embed_dim, h_dim, p_word_dropout=0.3, unk_idx=0, pad_idx=1, start_idx=2, eos_idx=3,
-                 pretrained_embeddings=None, freeze_embeddings=False, device=False):
-        super(AbstractVAE, self).__init__()
+class AbstractNetGen(nn.Module):
+    def __init__(self, n_node, n_vocab, n_labels, embed_dim, p_word_dropout=0.5, unk_idx=0, pad_idx=1,
+                 start_idx=2, eos_idx=3, pretrained_embeddings=None, freeze_embeddings=False, teacher_forcing=True, device=False):
+        super(AbstractNetGen, self).__init__()
         self.UNK_IDX = unk_idx
         self.PAD_IDX = pad_idx
         self.START_IDX = start_idx
@@ -200,8 +200,9 @@ class AbstractVAE(nn.Module):
 
         self.n_vocab = n_vocab
         self.n_labels = n_labels
-        self.h_dim = h_dim
         self.p_word_dropout = p_word_dropout
+        self.n_node = n_node
+        self.teacher_forcing = teacher_forcing
 
         self.device = device
 
@@ -220,257 +221,6 @@ class AbstractVAE(nn.Module):
 
             if freeze_embeddings:
                 self.word_emb.weight.requires_grad = False
-
-    def forward_encoder(self, inputs):
-        """
-        Inputs is batch of sentences: seq_len x mbsize
-        """
-        inputs = self.word_emb(inputs)
-        return self.forward_encoder_embed(inputs)
-
-    def forward_encoder_embed(self, inputs):
-        """
-        Inputs is embeddings of: seq_len x mbsize x emb_dim
-        """
-        _, h = self.encoder(inputs, None)
-
-        # Forward to latent
-        h = h.view(-1, self.h_dim)
-
-        mu = self.q_mu(h)
-        logvar = self.q_logvar(h)
-
-        return mu, logvar
-
-    def sample_z(self, mu, logvar):
-        """
-        Reparameterization trick: z = mu + std*eps; eps ~ N(0, I)
-        """
-        eps = Variable(torch.randn_like(mu))
-        eps = eps.to(self.device)
-        return mu + torch.exp(logvar / 2) * eps
-
-    def sample_z_prior(self, mbsize):
-        """
-        Sample z ~ p(z) = N(0, I)
-        """
-        z = Variable(torch.randn(mbsize, self.z_dim))
-        z = z.to(self.device)
-        return z
-
-    def forward_decoder(self, inputs, z):
-        """
-        Inputs must be embeddings: seq_len x mbsize
-        """
-        dec_inputs = self.word_dropout(inputs)
-
-        # Forward
-        seq_len = dec_inputs.size(0)
-
-        # 1 x mbsize x z_dim
-        init_h = z.unsqueeze(0)
-        inputs_emb = self.word_emb(dec_inputs)  # seq_len x mbsize x emb_dim
-        inputs_emb = torch.cat([inputs_emb, init_h.repeat(seq_len, 1, 1)], 2)
-
-        outputs, _ = self.decoder(inputs_emb, init_h)
-        seq_len, mbsize, _ = outputs.size()
-
-        outputs = outputs.view(seq_len * mbsize, -1)
-        y = self.decoder_fc(outputs)
-        y = y.view(seq_len, mbsize, self.n_vocab)
-
-        return y
-
-    def generate_sentences(self, batch_size, length, temp=1.0, z=None):
-        """
-        Generate sentences and corresponding z of (batch_size x max_sent_len)
-        """
-        self.eval()
-
-        if z is None:
-            z = self.sample_z_prior(batch_size)
-
-        X_gen = self.sample_sentence(z, mask, length, raw=True, temp=temp)
-
-        # Back to default state: train
-        self.train()
-
-        return X_gen
-
-    def sample_sentence(self, z, length, raw=False, temp=1.0):
-        """
-        Sample single sentence from p(x|z,c) according to given temperature.
-        `raw = True` means this returns sentence as in dataset which is useful
-        to train discriminator. `False` means that this will return list of
-        `word_idx` which is useful for evaluation.
-        """
-
-        word = torch.LongTensor([self.START_IDX])
-        word = Variable(word)  # '<start>'
-        word = word.to(self.device)
-
-        if not isinstance(z, Variable):
-            z = Variable(z)
-
-        z = z.view(1, 1, -1)
-        h = z
-
-        outputs = []
-
-        if raw:
-            outputs.append(self.START_IDX)
-
-        for i in range(length - 1):
-            emb = self.word_emb(word).view(1, 1, -1)
-            emb = torch.cat([emb, z], 2)
-
-            output, h = self.decoder(emb, h)
-            y = self.decoder_fc(output).view(-1)
-            y = F.softmax(y / temp, dim=0)
-
-            idx = torch.multinomial(y, num_samples=1)
-
-            word = Variable(torch.LongTensor([int(idx)]))
-            word = word.to(self.device)
-
-            idx = int(idx)
-
-            if not raw and idx == self.EOS_IDX:
-                break
-
-            outputs.append(idx)
-
-        if raw:
-            outputs = Variable(torch.LongTensor(outputs)).unsqueeze(0)
-            return outputs.to(self.device)
-        else:
-            return outputs
-
-    def word_dropout(self, inputs, padding_mask):
-        """
-        Do word dropout: with prob `p_word_dropout`, set the word to '<unk>'.
-        """
-        if isinstance(inputs, Variable):
-            data = inputs.data.clone()
-        else:
-            data = inputs.clone()
-
-        # Sample masks: elems with val 1 will be set to <unk>
-        mask = torch.from_numpy(
-            np.random.binomial(1, p=self.p_word_dropout, size=tuple(data.size()))
-                .astype('uint8')
-        )
-
-        mask = mask.to(self.device)
-        mask = mask * padding_mask.byte()
-
-        # Set to <unk>
-        data[mask] = self.UNK_IDX
-
-        return Variable(data)
-
-    def forward(self, *input):
-        pass
-
-    def train_model(self, args, dataset):
-        pass
-
-
-class NetGen(AbstractVAE):
-    def __init__(self, n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout=0.5, unk_idx=0, pad_idx=1, start_idx=2,
-                 eos_idx=3, pretrained_embeddings=None, freeze_embeddings=False, device=False):
-        super(NetGen, self).__init__(n_vocab, n_labels, embed_dim, h_dim, p_word_dropout, unk_idx, pad_idx, start_idx, eos_idx,
-                                     pretrained_embeddings, freeze_embeddings, device)
-
-        # self.z_dim = n_node * z_dim
-        self.node_dim = 2 * h_dim
-        self.n_node = n_node
-
-        """
-        Encoder is GRU with FC layers connected to last hidden unit
-        """
-        self.encoder = nn.LSTM(self.emb_dim, h_dim, bidirectional=True, batch_first=True)
-        self.encoder_fc_c = nn.Linear(self.node_dim, h_dim)
-        self.encoder_fc_h = nn.Linear(self.node_dim, h_dim)
-        self.encoder_ = nn.ModuleList([
-            self.encoder, self.encoder_fc_c, self.encoder_fc_h
-        ])
-
-        """
-        Decoder is GRU with `z` appended at its inputs
-        """
-        self.decoder_h_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
-        self.decoder_c_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
-        self.decoder_d_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
-        self.decoder = nn.LSTM(self.emb_dim + z_dim, z_dim, num_layers=1, dropout=0.3, batch_first=True)
-        # self.decoder_fc = nn.Linear(n_node * self.emb_dim, n_vocab)
-        self.decoder_fc = nn.Linear(z_dim, self.n_vocab)
-
-        """
-        Generator 
-        """
-        self.generate_lstm = nn.LSTM(self.node_dim, h_dim, batch_first=True)
-        self.attention_network = Attention(self.node_dim)
-        self.generate_adj = nn.Sequential(
-            nn.Linear(self.node_dim, self.node_dim // 2),
-            nn.ReLU(),
-            nn.Linear(self.node_dim // 2, self.node_dim // 4)
-        )
-
-        """
-        Graph Encoder is GCN with pooling layer
-        """
-        self.graph_encoder = GraphConvolution(self.node_dim, self.node_dim, bias=False)
-        self.graph_encoder_fc = nn.Linear(2 * self.node_dim, self.node_dim, bias=False)
-        self.decoder_ = nn.ModuleList([
-            self.decoder, self.decoder_fc, self.decoder_c_linear, self.decoder_h_linear, self.decoder_d_linear,
-            self.attention_network,
-            self.generate_lstm, self.generate_adj,
-            self.graph_encoder, self.graph_encoder_fc
-        ])
-
-        """
-        Classifier is DNN
-        """
-        self.disc = Discriminator(2 * self.node_dim)
-
-        """
-        Classifier is DNN
-        """
-        self.graph_encoder_cls = GraphConvolution(self.node_dim, self.node_dim, bias=False)
-        self.graph_encoder_cls_fc = nn.Linear(2 * self.node_dim, self.node_dim, bias=False)
-        self.classifier = nn.Sequential(
-            nn.Linear(self.node_dim * self.n_node, self.emb_dim),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(self.emb_dim, self.n_labels)
-        )
-        self.classifier_ = nn.ModuleList([
-            self.graph_encoder_cls, self.graph_encoder_cls_fc, self.classifier
-        ])
-
-        """
-        Grouping the model's parameters: separating encoder, decoder, and discriminator
-        """
-        self.encoder_params = filter(lambda p: p.requires_grad, self.encoder_.parameters())
-
-        self.decoder_params = filter(lambda p: p.requires_grad, self.decoder_.parameters())
-
-        self.classifier_params = filter(lambda p: p.requires_grad, self.classifier_.parameters())
-
-        self.ae_params = chain(
-            self.word_emb.parameters(), self.encoder_.parameters(), self.decoder_.parameters()
-        )
-        self.ae_params = filter(lambda p: p.requires_grad, self.ae_params)
-
-        """
-        Use GPU if set
-        """
-
-        # for m in self.modules():
-        #     self.weights_init(m)
-
-        self.to(self.device)
 
     def weights_init(self, m):
         if isinstance(m, nn.Linear):
@@ -503,15 +253,6 @@ class NetGen(AbstractVAE):
 
         return Variable(data)
 
-    def forward_graph_encoder(self, inputs, adj):
-        # x = F.relu(self.graph_encoder(input, adj))
-        x = self.graph_encoder(inputs, adj)
-        x = F.relu(self.graph_encoder_fc(torch.cat((x, inputs), -1)))
-        x = x.view(-1, self.n_node * self.node_dim)
-        # x = self.graph_encoder_trans(x)
-
-        return x
-
     def forward_encoder(self, inputs):
         """
         Inputs is batch of sentences: seq_len x mbsize
@@ -532,7 +273,7 @@ class NetGen(AbstractVAE):
         c = F.relu(self.encoder_fc_c(c))
         return outputs, (h, c)
 
-    def forward_decoder(self, inputs, z, teacher_force=False):
+    def forward_decoder(self, inputs, z):
         """
         Inputs must be embeddings: seq_len x mbsize
         """
@@ -544,7 +285,7 @@ class NetGen(AbstractVAE):
         h = self.decoder_h_linear(init_h).relu()
         d = self.decoder_d_linear(init_h).relu().transpose(1, 0)
 
-        if teacher_force:
+        if self.teacher_forcing:
             dec_inputs = self.word_dropout(inputs)
             inputs_emb = self.word_emb(dec_inputs)  # seq_len x mbsize x emb_dim
             inputs_emb = torch.cat([inputs_emb, d.repeat(1, length, 1)], -1)
@@ -569,77 +310,7 @@ class NetGen(AbstractVAE):
 
         return y
 
-    def forward(self, sentence, mask, classifier):
-        """
-        Params:
-        -------
-        sentence: sequence of word indices.
-        use_c_prior: whether to sample `c` from prior or from `discriminator`.
-
-        Returns:
-        --------
-        recon_loss: reconstruction loss of VAE.
-        kl_loss: KL-div loss of VAE.
-        """
-
-        mbsize = sentence.size(0)
-
-        enc_inputs = sentence
-        dec_inputs = sentence
-
-        pad_words = torch.LongTensor([self.PAD_IDX]).repeat(mbsize, 1).to(self.device)
-        dec_targets = torch.cat([sentence[:, 1:], pad_words], dim=1)
-
-        # Encoder: sentence -> z
-        z, h = self.forward_encoder(enc_inputs)
-
-        # Generator: z -> graph
-        # text, adj = self.generate_graph(z, temp=temp)
-        # text, adj, entropy, cost = self.generate_graph(z, mask, return_entropy=True)
-        text, adj, attentions, penal2, c_loss = self.generate_graph(z, h, enc_inputs, mask)
-
-        # Graph Encoder: graph -> z'
-        z1 = self.forward_graph_encoder(text, adj)
-        # z1 = text.view(-1, self.n_node * self.node_dim)
-
-        # Decoder: sentence -> y
-        y = self.forward_decoder(dec_inputs, z1)
-
-        recon_loss = F.cross_entropy(y.view(-1, self.n_vocab), dec_targets.view(-1), size_average=True, ignore_index=self.PAD_IDX)
-
-        penal1 = torch.distributions.Categorical(probs=attentions).entropy().mean()
-
-        if classifier:
-            # classifier: graph -> prediction
-            x = self.graph_encoder_cls(text, adj)
-            x = F.relu(self.graph_encoder_cls_fc(torch.cat((x, text), -1)))
-            # x = text
-            x = x.view(-1, self.node_dim * self.n_node)
-            outputs = self.classifier(x)
-
-            return recon_loss, outputs, penal1, penal2, c_loss
-        else:
-            return recon_loss, penal1, penal2, c_loss
-
-    def forward_classifier(self, inputs, mask):
-
-        # Encoder: sentence -> z
-        z, h = self.forward_encoder(inputs)
-
-        # Generator: z -> graph
-        # text, adj = self.generate_graph(z, temp)
-        # text, adj = self.generate_graph(z, mask, return_entropy=False)
-        text, adj, _, _, _ = self.generate_graph(z, h, inputs, mask)
-
-        # classifier: graph -> prediction
-        x = self.graph_encoder_cls(text, adj)
-        x = F.relu(self.graph_encoder_cls_fc(torch.cat((x, text), -1)))
-        # x = text
-        x = x.view(-1, self.node_dim * self.n_node)
-        outputs = self.classifier(x)
-        return outputs
-
-    def generate_graph(self, z, hidden_state, inputs, mask):
+    def generate_node(self, z, hidden_state, mask):
         bsize, n, d_k = z.size()
         h, c = hidden_state
 
@@ -660,149 +331,19 @@ class NetGen(AbstractVAE):
             s = c_t.data
             coverage = coverage_next
 
-            i_t = torch.bmm(attn_dist, self.word_emb(inputs))
-            g_emb.append(i_t.data)
-
-
         text = torch.cat(outputs, dim=1)
         attentions = torch.cat(atts, dim=1)
-        S = torch.cat(states, dim=1)
-        g_emb = torch.cat(g_emb, dim=1)
-        adj, penal = self.generate_adjacency_matrix(S, g_emb)
 
-        return text, adj, attentions, penal, closs
+        return text, attentions, closs
 
-    def generate_adjacency_matrix(self, z, text=None):
-        # z = torch.cat((z, text), -1)
-        z = self.generate_adj(z)
+    def forward(self, *input):
+        pass
 
-        # adj = F.sigmoid(torch.matmul(z, z.transpose(2, 1)))
+    def forward_classifier(self, inputs, mask):
+        pass
 
-        # GLoMo
-        # I = torch.eye(self.n_node).to(self.device)
-        # z = self.generate_adj(z)
-        # z = z / z.norm(p=2, dim=-1, keepdim=True)
-        # adj = F.relu(torch.matmul(z, z.transpose(2, 1))) ** 2
-        # # adj = adj - I
-        # adj = adj / adj.sum(dim=-1, keepdim=True)
-
-        z = z / torch.norm(z, p=2, dim=-1, keepdim=True).data
-        adj = torch.matmul(z, z.transpose(2, 1))
-        adj = F.relu(adj)
-        # # adj = torch.matmul(z, z.transpose(2, 1))
-        # mask = (adj > 0.5).float()
-        # adj = adj * mask
-        #
-        # # I = (torch.ones(self.n_node, self.n_node) - torch.eye(self.n_node)).to(self.device)
-        I = torch.eye(self.n_node).to(self.device)
-        # # penal = l2_matrix_norm(adj @ adj.transpose(1, 2) - I)
-        penal = l2_matrix_norm(adj - I)
-
-        # adj = adj / adj.sum(dim=-1, keepdim=True)
-
-        return adj, penal
-
-    def train_model(self, args, dataset, logger):
-        """train the whole network"""
-        self.train()
-        self.dataset = dataset
-
-        alpha = 0
-        beta = 0
-        gamma = 0
-        lam = args.cls_weight
-
-        trainer = optim.Adam(self.parameters(), lr=args.lr)
-        criterion_cls = nn.CrossEntropyLoss().to(self.device)
-
-        patience = 0
-        best_val_acc, best_test_acc, best_iter = 0, 0, 0
-        list_loss_recon, list_loss_penal1, list_loss_penal2, list_loss_closs = [], [], [], []
-        list_loss_cls = []
-        train_start_time = time.time()
-        train_iter = dataset.build_train_iter(args.batch_size, self.device)
-        val_iter, test_iter = dataset.build_test_iter(args.batch_size, self.device, shuffle=False)
-
-        for epoch in range(1, args.epochs):
-
-            if epoch == 1:
-                alpha = args.alpha
-                beta = args.beta
-                gamma = args.gamma
-
-            for i, subdata in enumerate([train_iter]):
-                for batch in iter(subdata):
-                    inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
-                    # mask = dataset.create_mask(inputs, device=self.device)
-
-                    if lam != 0 and i == 0:
-                        recon_loss, outputs, penal1, penal2, closs = self.forward(inputs, mask=mask, classifier=True)
-                        loss_cls = criterion_cls(outputs, labels)
-                        list_loss_cls.append(loss_cls.item())
-                        loss_vae = recon_loss + lam * loss_cls + alpha * penal1 + gamma * penal2 + beta * closs
-                    else:
-
-                        recon_loss, penal1, penal2, closs = self.forward(inputs, mask=mask, classifier=False)
-                        loss_vae = recon_loss + alpha * penal1 + gamma * penal2 + beta * closs
-
-                    if torch.isnan(loss_vae):
-                        a=1
-                    list_loss_recon.append(recon_loss.item())
-                    list_loss_penal1.append(penal1.item())
-                    list_loss_penal2.append(penal2.item())
-                    list_loss_closs.append(closs.item())
-
-                    trainer.zero_grad()
-                    loss_vae.backward()
-                    # grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), 10)
-                    trainer.step()
-
-            if epoch % args.log_every == 0:
-                duration = time.time() - train_start_time
-                avr_loss_recon = np.mean(list_loss_recon)
-                avr_loss_penal1 = np.mean(list_loss_penal1)
-                avr_loss_penal2 = np.mean(list_loss_penal2)
-                avr_closs = np.mean(list_loss_closs)
-                avr_cls = np.mean(list_loss_cls)
-                list_loss_recon, list_loss_penal1, list_loss_penal2, list_loss_closs = [], [], [], []
-                list_loss_cls = []
-                logger.info(f'Epoch-{epoch}; loss_recon: {avr_loss_recon:.4f}; loss_cls: {avr_cls:.4f}; penal1: {avr_loss_penal1:.4f}; '
-                            f' penal2: {avr_loss_penal2:.4f}; avr_closs: {avr_closs:.4f}; duration: {round(duration)}')
-
-                if lam == 0:
-                    train_acc, val_acc, test_acc = self.train_model_classifier(args, dataset)
-                else:
-                    train_acc = self.test(dataset, train_iter)
-                    val_acc = self.test(dataset, val_iter)
-                    test_acc = self.test(dataset, test_iter)
-
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    best_test_acc = test_acc
-                    best_iter = epoch
-                    patience = 0
-                    graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='test')
-                    graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='val')
-                    graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='train')
-                else:
-                    if epoch > args.minimal_epoch:
-                        patience += args.log_every
-
-                logger.info(f'Train Acc: {train_acc:.4f}; Valid Acc: {val_acc:.4f}; Test Acc: {test_acc:.4f}; Best Acc: {best_test_acc:.4f} @ {best_iter}')
-
-                if args.early_stop and patience > args.patience:
-                    break
-
-            if epoch % args.save_every == 0:
-                graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'),
-                                          save_name='test')
-                graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'),
-                                          save_name='val')
-                graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'),
-                                          save_name='train')
-
-        logger.info(f'Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_iter}')
-        return best_val_acc, best_test_acc
+    def train_model(self, args, dataset):
+        pass
 
     def train_model_classifier(self, args, dataset):
         """train the whole network"""
@@ -867,7 +408,7 @@ class NetGen(AbstractVAE):
         # print(f'Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ iter {best_iter}')
         return best_train_acc, best_val_acc, best_test_acc
 
-    def test(self, dataset, data_iter):
+    def test(self, data_iter):
         self.eval()
         total_accuracy = []
         with torch.no_grad():
@@ -880,6 +421,274 @@ class NetGen(AbstractVAE):
         self.train()
         return acc
 
+
+class NetGen(AbstractNetGen):
+    def __init__(self, n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout=0.5, unk_idx=0, pad_idx=1, start_idx=2,
+                 eos_idx=3, pretrained_embeddings=None, freeze_embeddings=False, teacher_forcing=True, device=False):
+        super(NetGen, self).__init__(n_node, n_vocab, n_labels, embed_dim, p_word_dropout, unk_idx, pad_idx, start_idx, eos_idx,
+                                     pretrained_embeddings, freeze_embeddings, teacher_forcing, device)
+
+        self.node_dim = 2 * h_dim
+
+        """
+        Encoder is GRU with FC layers connected to last hidden unit
+        """
+        self.encoder = nn.LSTM(self.emb_dim, h_dim, bidirectional=True, batch_first=True)
+        self.encoder_fc_c = nn.Linear(self.node_dim, h_dim)
+        self.encoder_fc_h = nn.Linear(self.node_dim, h_dim)
+        self.encoder_ = nn.ModuleList([
+            self.encoder, self.encoder_fc_c, self.encoder_fc_h
+        ])
+
+        """
+        Decoder is GRU with `z` appended at its inputs
+        """
+        self.decoder_h_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
+        self.decoder_c_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
+        self.decoder_d_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
+        self.decoder = nn.LSTM(self.emb_dim + z_dim, z_dim, num_layers=1, dropout=0.3, batch_first=True)
+        # self.decoder_fc = nn.Linear(n_node * self.emb_dim, n_vocab)
+        self.decoder_fc = nn.Linear(z_dim, self.n_vocab)
+
+        """
+        Generator 
+        """
+        self.generate_lstm = nn.LSTM(self.node_dim, h_dim, batch_first=True)
+        self.attention_network = Attention(self.node_dim)
+        self.generate_adj = nn.Sequential(
+            nn.Linear(h_dim * 2, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, self.n_node * self.n_node),
+            nn.Sigmoid()
+        )
+
+        """
+        Graph Encoder is GCN with pooling layer
+        """
+        self.graph_encoder = GraphConvolution(self.node_dim, self.node_dim, bias=False)
+        self.graph_encoder_fc = nn.Linear(2 * self.node_dim, self.node_dim, bias=False)
+        self.decoder_ = nn.ModuleList([
+            self.decoder, self.decoder_fc, self.decoder_c_linear, self.decoder_h_linear, self.decoder_d_linear,
+            self.attention_network,
+            self.generate_lstm, self.generate_adj,
+            self.graph_encoder, self.graph_encoder_fc
+        ])
+
+        """
+        Classifier is DNN
+        """
+        self.graph_encoder_cls = GraphConvolution(self.node_dim, self.node_dim, bias=False)
+        self.graph_encoder_cls_fc = nn.Linear(2 * self.node_dim, self.node_dim, bias=False)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.node_dim * self.n_node, self.node_dim * self.n_node // 4),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(self.node_dim * self.n_node // 4, self.n_labels)
+        )
+        self.classifier_ = nn.ModuleList([
+            self.graph_encoder_cls, self.graph_encoder_cls_fc, self.classifier
+        ])
+
+        """
+        Grouping the model's parameters: separating encoder, decoder, and discriminator
+        """
+        self.encoder_params = filter(lambda p: p.requires_grad, self.encoder_.parameters())
+
+        self.decoder_params = filter(lambda p: p.requires_grad, self.decoder_.parameters())
+
+        self.classifier_params = filter(lambda p: p.requires_grad, self.classifier_.parameters())
+
+        self.ae_params = chain(
+            self.word_emb.parameters(), self.encoder_.parameters(), self.decoder_.parameters()
+        )
+        self.ae_params = filter(lambda p: p.requires_grad, self.ae_params)
+
+        """
+        Use GPU if set
+        """
+
+        # for m in self.modules():
+        #     self.weights_init(m)
+
+        self.to(self.device)
+
+    def forward_graph_encoder(self, inputs, adj):
+        # x = F.relu(self.graph_encoder(input, adj))
+        x = self.graph_encoder(inputs, adj)
+        x = F.relu(self.graph_encoder_fc(torch.cat((x, inputs), -1)))
+        x = x.view(-1, self.n_node * self.node_dim)
+        # x = self.graph_encoder_trans(x)
+
+        return x
+
+    def forward(self, sentence, mask, classifier):
+        """
+        Params:
+        -------
+        sentence: sequence of word indices.
+        use_c_prior: whether to sample `c` from prior or from `discriminator`.
+
+        Returns:
+        --------
+        recon_loss: reconstruction loss of VAE.
+        kl_loss: KL-div loss of VAE.
+        """
+
+        mbsize = sentence.size(0)
+
+        enc_inputs = sentence
+        dec_inputs = sentence
+
+        pad_words = torch.LongTensor([self.PAD_IDX]).repeat(mbsize, 1).to(self.device)
+        dec_targets = torch.cat([sentence[:, 1:], pad_words], dim=1)
+
+        # Encoder: sentence -> z
+        z, h = self.forward_encoder(enc_inputs)
+
+        # Generator: z -> node
+        text, attentions, c_loss = self.generate_node(z, h, mask)
+
+        # Generator: z -> adj
+        adj = self.generate_adjacency_matrix(h)
+
+        # Graph Encoder: graph -> z'
+        z1 = self.forward_graph_encoder(text, adj)
+        # z1 = text.view(-1, self.n_node * self.node_dim)
+
+        # Decoder: sentence -> y
+        y = self.forward_decoder(dec_inputs, z1)
+
+        recon_loss = F.cross_entropy(y.view(-1, self.n_vocab), dec_targets.view(-1), size_average=True, ignore_index=self.PAD_IDX)
+
+        penal1 = torch.distributions.Categorical(probs=attentions).entropy().mean()
+
+        if classifier:
+            # classifier: graph -> prediction
+            x = self.graph_encoder_cls(text, adj)
+            x = F.relu(self.graph_encoder_cls_fc(torch.cat((x, text), -1)))
+            # x = text
+            x = x.view(-1, self.node_dim * self.n_node)
+            outputs = self.classifier(x)
+
+            return recon_loss, outputs, penal1, c_loss
+        else:
+            return recon_loss, penal1, c_loss
+
+    def forward_classifier(self, inputs, mask):
+
+        # Encoder: sentence -> z
+        z, h = self.forward_encoder(inputs)
+
+        # Generator: z -> node
+        text, _, _ = self.generate_node(z, h, mask)
+
+        # Generator: z -> adj
+        adj = self.generate_adjacency_matrix(h)
+
+        # classifier: graph -> prediction
+        x = self.graph_encoder_cls(text, adj)
+        x = F.relu(self.graph_encoder_cls_fc(torch.cat((x, text), -1)))
+        # x = text
+        x = x.view(-1, self.node_dim * self.n_node)
+        outputs = self.classifier(x)
+        return outputs
+
+    def generate_adjacency_matrix(self, hidden_state):
+        adj = self.generate_adj(torch.cat(hidden_state, dim=-1))
+        b_size = adj.size()[1]
+        adj = adj.view(b_size, self.n_node, self.n_node)
+
+        return adj
+
+    def generate_graph(self, z, hidden_state, mask):
+        node, attentions, _ = self.generate_node(z, hidden_state, mask)
+        adj = self.generate_adjacency_matrix(hidden_state)
+        return node, adj, attentions
+
+    def train_model(self, args, dataset, logger):
+        """train the whole network"""
+        self.train()
+        self.dataset = dataset
+
+        alpha = args.alpha
+        beta = args.beta
+        lam = args.cls_weight
+        gam = args.recon_weight
+
+        trainer = optim.Adam(self.parameters(), lr=args.lr)
+        criterion_cls = nn.CrossEntropyLoss().to(self.device)
+
+        patience = 0
+        best_val_acc, best_test_acc, best_iter = 0, 0, 0
+        list_loss_recon, list_loss_penal1, list_loss_closs = [], [], []
+        list_loss_cls = []
+        train_start_time = time.time()
+        train_iter = dataset.build_train_iter(args.batch_size, self.device)
+        val_iter, test_iter = dataset.build_test_iter(args.batch_size, self.device, shuffle=False)
+
+        for epoch in range(1, args.epochs):
+
+            for i, subdata in enumerate([train_iter]):
+                for batch in iter(subdata):
+                    inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+                    # mask = dataset.create_mask(inputs, device=self.device)
+
+                    recon_loss, outputs, penal1, closs = self.forward(inputs, mask=mask, classifier=True)
+                    loss_cls = criterion_cls(outputs, labels)
+                    list_loss_cls.append(loss_cls.item())
+                    loss_vae = gam * recon_loss + lam * loss_cls + alpha * penal1 + beta * closs
+
+                    if torch.isnan(loss_vae):
+                        a=1
+                    list_loss_recon.append(recon_loss.item())
+                    list_loss_penal1.append(penal1.item())
+                    list_loss_closs.append(closs.item())
+
+                    trainer.zero_grad()
+                    loss_vae.backward()
+                    # grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), 10)
+                    trainer.step()
+
+            if epoch % args.log_every == 0:
+                duration = time.time() - train_start_time
+                avr_loss_recon = np.mean(list_loss_recon)
+                avr_loss_penal1 = np.mean(list_loss_penal1)
+                avr_closs = np.mean(list_loss_closs)
+                avr_cls = np.mean(list_loss_cls)
+                list_loss_recon, list_loss_penal1, list_loss_penal2, list_loss_closs = [], [], [], []
+                list_loss_cls = []
+                logger.info(f'Epoch-{epoch}; loss_recon: {avr_loss_recon:.4f}; loss_cls: {avr_cls:.4f}; penal1: {avr_loss_penal1:.4f}; '
+                            f'avr_closs: {avr_closs:.4f}; duration: {round(duration)}')
+
+                train_acc = self.test(train_iter)
+                val_acc = self.test(val_iter)
+                test_acc = self.test(test_iter)
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_test_acc = test_acc
+                    best_iter = epoch
+                    patience = 0
+                    graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='test')
+                    graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='val')
+                    graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='train')
+                else:
+                    if epoch > args.minimal_epoch:
+                        patience += args.log_every
+
+                logger.info(f'Train Acc: {train_acc:.4f}; Valid Acc: {val_acc:.4f}; Test Acc: {test_acc:.4f}; Best Acc: {best_test_acc:.4f} @ {best_iter}')
+
+                if args.early_stop and patience > args.patience:
+                    break
+
+            if epoch % args.save_every == 0:
+                graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='test')
+                graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='val')
+                graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='train')
+
+        logger.info(f'Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_iter}')
+        return best_val_acc, best_test_acc
+
     def output_graph(self, dataset, data_iter, save_path=None, save_name=''):
         self.eval()
         input_list, adj_list, word_list = [], [], []
@@ -888,7 +697,7 @@ class NetGen(AbstractVAE):
                 inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
 
                 z, h = self.forward_encoder(inputs)
-                text, adj, attentions, _, _ = self.generate_graph(z, h, inputs, mask)
+                text, adj, attentions = self.generate_graph(z, h, mask)
                 chosen = attentions.argmax(dim=-1).cpu().numpy()
 
                 for ins, ch in zip(inputs.cpu().numpy(), chosen):
@@ -919,174 +728,117 @@ class NetGen(AbstractVAE):
         return input_list, word_list, adj_list
 
 
-class NetGen1(NetGen):
+class NetGenS(NetGen):
     def __init__(self, n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout=0.5, unk_idx=0, pad_idx=1,
-                 start_idx=2, eos_idx=3, pretrained_embeddings=None, freeze_embeddings=False, device=False):
-        super(NetGen1, self).__init__(n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout, unk_idx,
-                                      pad_idx, start_idx, eos_idx, pretrained_embeddings, freeze_embeddings, device)
-        self.shared_h = torch.zeros(1, self.node_dim, requires_grad=False).to(self.device)
-        self.shared_hl = None
-        self.share_flag = 0
-        self.share_counter = 0
+                 start_idx=2, eos_idx=3, pretrained_embeddings=None, freeze_embeddings=False, teacher_forcing=True, device=False):
+        super(NetGenS, self).__init__(n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout, unk_idx,
+                                      pad_idx, start_idx, eos_idx, pretrained_embeddings, freeze_embeddings, teacher_forcing, device)
 
-    def forward_encoder_embed(self, inputs):
         """
-        Inputs is embeddings of: seq_len x mbsize x emb_dim
+        Classifier is DNN
         """
-        outputs, (h, c) = self.encoder(inputs)
-        bsize = inputs.size()[0]
+        self.graph_encoder_cls_S = GraphConvolution(embed_dim, embed_dim, bias=False)
+        self.graph_encoder_cls_fc_S = nn.Linear(2 * embed_dim, embed_dim, bias=False)
+        self.classifier_S = nn.Sequential(
+            nn.Linear(self.n_node * embed_dim, self.n_node * embed_dim // 4),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(self.n_node * embed_dim // 4, self.n_labels)
+        )
+        self.classifierS_ = nn.ModuleList([
+            self.graph_encoder_cls_S, self.graph_encoder_cls_fc_S, self.classifier_S
+        ])
 
-        h = h.view(1, bsize, -1)
-        c = c.view(1, bsize, -1)
-        h = F.tanh(self.encoder_fc_h(h))
-        c = F.tanh(self.encoder_fc_c(c))
+        self.classifierS_params = filter(lambda p: p.requires_grad, self.classifierS_.parameters())
 
-        if self.share_flag:
-            # self.h = (h, c)
-            self.shared_h += torch.cat((h.data.mean(dim=1), c.data.mean(dim=1)), dim=-1)
-
-        return outputs, (h, c)
-
-    def forward(self, sentence, mask, classifier):
         """
-        Params:
-        -------
-        sentence: sequence of word indices.
-        use_c_prior: whether to sample `c` from prior or from `discriminator`.
-
-        Returns:
-        --------
-        recon_loss: reconstruction loss of VAE.
-        kl_loss: KL-div loss of VAE.
+        Use GPU if set
         """
 
-        mbsize = sentence.size(0)
+        # for m in self.modules():
+        #     self.weights_init(m)
 
-        enc_inputs = sentence
-        dec_inputs = sentence
+        self.to(self.device)
 
-        pad_words = torch.LongTensor([self.PAD_IDX]).repeat(mbsize, 1).to(self.device)
-        dec_targets = torch.cat([sentence[:, 1:], pad_words], dim=1)
+    def forward_classifierS(self, inputs, mask):
 
         # Encoder: sentence -> z
-        z, h = self.forward_encoder(enc_inputs)
+        z, h = self.forward_encoder(inputs)
 
-        # Generator: z -> graph
-        # text, adj = self.generate_graph(z, temp=temp)
-        # text, adj, entropy, cost = self.generate_graph(z, mask, return_entropy=True)
-        text, adj, attentions, penal2, c_loss = self.generate_graph(z, h, enc_inputs, mask)
+        # Generator: z -> node
+        text, attentions, _ = self.generate_node(z, h, mask)
+        chosen = attentions.argmax(dim=-1)
+        indices = inputs.gather(dim=1, index=chosen)
+        text = self.dataset.TEXT.vocab.vectors[indices].to(self.device)
 
-        # Graph Encoder: graph -> z'
-        z1 = self.forward_graph_encoder(text, adj)
-        # z1 = text.view(-1, self.n_node * self.node_dim)
+        # Generator: z -> adj
+        adj = self.generate_adjacency_matrix(h)
 
-        # Decoder: sentence -> y
-        y = self.forward_decoder(dec_inputs, z1)
-
-        recon_loss = F.cross_entropy(y.view(-1, self.n_vocab), dec_targets.view(-1), size_average=True, ignore_index=self.PAD_IDX)
-
-        penal1 = torch.distributions.Categorical(probs=attentions).entropy().mean()
-
-        if self.shared_hl is not None:
-            h = torch.cat(h, dim=-1)
-            lloss = -F.l1_loss(h, self.shared_hl.expand_as(h))
-        else:
-            lloss = torch.zeros([])
-
-        if classifier:
-            # classifier: graph -> prediction
-            x = self.graph_encoder_cls(text, adj)
-            x = F.relu(self.graph_encoder_cls_fc(torch.cat((x, text), -1)))
-            # x = text
-            x = x.view(-1, self.node_dim * self.n_node)
-            outputs = self.classifier(x)
-
-            return recon_loss, outputs, penal1, penal2, c_loss, lloss
-        else:
-            return recon_loss, penal1, penal2, c_loss, lloss
+        # classifier: graph -> prediction
+        x = self.graph_encoder_cls_S(text, adj)
+        x = F.relu(self.graph_encoder_cls_fc_S(torch.cat((x, text), -1)))
+        # x = text
+        x = x.view(-1, self.emb_dim * self.n_node)
+        outputs = self.classifier_S(x)
+        return outputs
 
     def train_model(self, args, dataset, logger):
         """train the whole network"""
         self.train()
-        # self.dataset = dataset
+        self.dataset = dataset
 
         alpha = args.alpha
         beta = args.beta
-        gamma = args.gamma
         lam = args.cls_weight
-        theta = args.theta
+        gam = args.recon_weight
 
         trainer = optim.Adam(self.parameters(), lr=args.lr)
         criterion_cls = nn.CrossEntropyLoss().to(self.device)
 
         patience = 0
         best_val_acc, best_test_acc, best_iter = 0, 0, 0
-        recon_logger = LossLogger()
-        p1_logger = LossLogger()
-        p2_logger = LossLogger()
-        closs_logger = LossLogger()
-        lloss_logger = LossLogger()
-        cls_logger = LossLogger()
+        list_loss_recon, list_loss_penal1, list_loss_closs = [], [], []
+        list_loss_cls = []
         train_start_time = time.time()
+        all_iter = dataset.build_all_iter(args.batch_size, self.device)
         train_iter = dataset.build_train_iter(args.batch_size, self.device)
         val_iter, test_iter = dataset.build_test_iter(args.batch_size, self.device, shuffle=False)
 
         for epoch in range(1, args.epochs):
 
-            self.shared_h[:] = 0
-            self.share_flag = 1
-            self.share_counter = 0
-
-            for i, subdata in enumerate([train_iter]):
+            for i, subdata in enumerate([all_iter]):
                 for batch in iter(subdata):
-
-                    self.share_counter += 1
-
                     inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
                     # mask = dataset.create_mask(inputs, device=self.device)
 
-                    if lam != 0 and i == 0:
-                        recon_loss, outputs, penal1, penal2, closs, lloss = self.forward(inputs, mask=mask, classifier=True)
-                        loss_cls = criterion_cls(outputs, labels)
-                        cls_logger.add(loss_cls.item())
-                        loss_vae = recon_loss + lam * loss_cls + alpha * penal1 + gamma * penal2 + beta * closs + theta * lloss
-                    else:
-                        recon_loss, penal1, penal2, closs, lloss = self.forward(inputs, mask=mask, classifier=False)
-                        loss_vae = recon_loss + alpha * penal1 + gamma * penal2 + beta * closs + theta * lloss
+                    recon_loss, outputs, penal1, closs = self.forward(inputs, mask=mask, classifier=True)
+                    loss_cls = criterion_cls(outputs, labels)
+                    list_loss_cls.append(loss_cls.item())
+                    loss_vae = gam * recon_loss + lam * loss_cls + alpha * penal1 + beta * closs
 
-                    if torch.isnan(recon_loss):
+                    if torch.isnan(loss_vae):
                         a=1
-                    recon_logger.add(recon_loss.item())
-                    p1_logger.add(penal1.item())
-                    p2_logger.add(penal2.item())
-                    closs_logger.add(closs.item())
-                    lloss_logger.add(lloss.item())
+                    list_loss_recon.append(recon_loss.item())
+                    list_loss_penal1.append(penal1.item())
+                    list_loss_closs.append(closs.item())
 
                     trainer.zero_grad()
                     loss_vae.backward()
-                    # grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), 5)
+                    # grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), 10)
                     trainer.step()
-
-            self.shared_hl = self.shared_h / self.share_counter
-            self.share_flag = 0
 
             if epoch % args.log_every == 0:
                 duration = time.time() - train_start_time
-                avr_loss_recon = recon_logger.get()
-                avr_loss_penal1 = p1_logger.get()
-                avr_loss_penal2 = p2_logger.get()
-                avr_closs = closs_logger.get()
-                avr_cls = cls_logger.get()
-                avr_lloss = lloss_logger.get()
+                avr_loss_recon = np.mean(list_loss_recon)
+                avr_loss_penal1 = np.mean(list_loss_penal1)
+                avr_closs = np.mean(list_loss_closs)
+                avr_cls = np.mean(list_loss_cls)
+                list_loss_recon, list_loss_penal1, list_loss_penal2, list_loss_closs = [], [], [], []
+                list_loss_cls = []
                 logger.info(f'Epoch-{epoch}; loss_recon: {avr_loss_recon:.4f}; loss_cls: {avr_cls:.4f}; penal1: {avr_loss_penal1:.4f}; '
-                            f' penal2: {avr_loss_penal2:.4f}; avr_closs: {avr_closs:.4f}; avr_lloss: {avr_lloss:.4f}; duration: {round(duration)}')
+                            f'avr_closs: {avr_closs:.4f}; duration: {round(duration)}')
 
-                if lam == 0:
-                    train_acc, val_acc, test_acc = self.train_model_classifier(args, dataset)
-                else:
-                    train_acc = self.test(dataset, train_iter)
-                    val_acc = self.test(dataset, val_iter)
-                    test_acc = self.test(dataset, test_iter)
+                train_acc, val_acc, test_acc = self.train_model_classifier(args)
 
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
@@ -1106,13 +858,552 @@ class NetGen1(NetGen):
                     break
 
             if epoch % args.save_every == 0:
-                graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'),
-                                          save_name='test')
-                graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'),
-                                          save_name='val')
-                graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'),
-                                          save_name='train')
+                graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='test')
+                graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='val')
+                graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='train')
 
         logger.info(f'Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_iter}')
         return best_val_acc, best_test_acc
 
+    def train_model_classifier(self, args):
+        """train the whole network"""
+        self.train()
+
+        self.classifierS_[0].reset_parameters()
+        self.classifierS_[1].reset_parameters()
+        for i in self.classifier_[2]:
+            if hasattr(i, 'reset_parameters'):
+                i.reset_parameters()
+        trainer_C = optim.Adam(filter(lambda p: p.requires_grad, self.classifierS_.parameters()), lr=args.eval_lr)
+        criterion_cls = nn.CrossEntropyLoss().to(self.device)
+
+        patience = 0
+        log_every = 5
+        list_loss_cls = []
+        best_train_acc, best_val_acc, best_test_acc, best_iter = 0, 0, 0, 0
+        train_start_time = time.time()
+
+        train_iter = self.dataset.build_train_iter(args.eval_batch_size, self.device)
+        val_iter, test_iter = self.dataset.build_test_iter(args.batch_size, self.device)
+
+        for epoch in range(1, args.eval_epochs):
+            for batch in iter(train_iter):
+                inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+
+                """ Update classifier """
+                outputs = self.forward_classifierS(inputs, mask)
+                loss_cls = criterion_cls(outputs, labels)
+                list_loss_cls.append(loss_cls.item())
+
+                trainer_C.zero_grad()
+                loss_cls.backward()
+                trainer_C.step()
+
+            if epoch % log_every == 0:
+                duration = time.time() - train_start_time
+                avr_loss_cls = np.mean(list_loss_cls)
+                list_loss_cls = []
+
+                val_acc = self.test(val_iter)
+                test_acc = self.test(test_iter)
+                train_acc = self.test(train_iter)
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_test_acc = test_acc
+                    best_train_acc = train_acc
+                    best_iter = epoch
+                    patience = 0
+                else:
+                    if epoch > args.eval_minimal_epoch:
+                        patience += log_every
+
+                if args.eval_early_stop and patience > args.eval_patience:
+                    break
+
+            # if epoch % 10 == 0:
+            #     print(f'Epoch-{epoch}; loss_cls: {avr_loss_cls:.4f}; Valid Acc: {val_acc:.4f}; Test Acc: {test_acc:.4f};'
+            #           f' duration: {duration:.2f}')
+
+        # print(f'Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ iter {best_iter}')
+        return best_train_acc, best_val_acc, best_test_acc
+
+    def test(self, data_iter):
+        self.eval()
+        total_accuracy = []
+        with torch.no_grad():
+            for batch in iter(data_iter):
+                inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+                outputs = self.forward_classifierS(inputs, mask)
+                accuracy = (outputs.argmax(1) == labels).float().mean().item()
+                total_accuracy.append(accuracy)
+        acc = sum(total_accuracy) / len(total_accuracy)
+        self.train()
+        return acc
+
+
+class NetGenWord(AbstractNetGen):
+    def __init__(self, n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout=0.5, unk_idx=0, pad_idx=1,
+                 start_idx=2, eos_idx=3, pretrained_embeddings=None, freeze_embeddings=False, teacher_forcing=True, device=False):
+        super(NetGenWord, self).__init__(n_node, n_vocab, n_labels, embed_dim, p_word_dropout, unk_idx, pad_idx,
+                                     start_idx, eos_idx, pretrained_embeddings, freeze_embeddings, teacher_forcing, device)
+
+        self.node_dim = 2 * h_dim
+
+        """
+        Encoder is GRU with FC layers connected to last hidden unit
+        """
+        self.encoder = nn.LSTM(self.emb_dim, h_dim, bidirectional=True, batch_first=True)
+        self.encoder_fc_c = nn.Linear(self.node_dim, h_dim)
+        self.encoder_fc_h = nn.Linear(self.node_dim, h_dim)
+        self.encoder_ = nn.ModuleList([
+            self.encoder, self.encoder_fc_c, self.encoder_fc_h
+        ])
+
+        """
+        Decoder is GRU with `z` appended at its inputs
+        """
+        self.decoder_h_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
+        self.decoder_c_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
+        self.decoder_d_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
+        self.decoder = nn.LSTM(self.emb_dim + z_dim, z_dim, num_layers=1, dropout=0.3, batch_first=True)
+        # self.decoder_fc = nn.Linear(n_node * self.emb_dim, n_vocab)
+        self.decoder_fc = nn.Linear(z_dim, self.n_vocab)
+
+        """
+        Generator 
+        """
+        self.generate_lstm = nn.LSTM(self.node_dim, h_dim, batch_first=True)
+        self.attention_network = Attention(self.node_dim)
+
+        """
+        Node Encoder is GCN with pooling layer
+        """
+        self.node_encoder_fc = nn.Linear(self.node_dim, self.node_dim, bias=False)
+        self.decoder_ = nn.ModuleList([
+            self.decoder, self.decoder_fc, self.decoder_c_linear, self.decoder_h_linear, self.decoder_d_linear,
+            self.attention_network, self.generate_lstm, self.node_encoder_fc
+        ])
+
+        """
+        Classifier is DNN
+        """
+        self.node_encoder_cls_fc = nn.Linear(self.node_dim, self.node_dim, bias=False)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.node_dim * self.n_node, self.node_dim * self.n_node // 4),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(self.node_dim * self.n_node // 4, self.n_labels)
+        )
+        self.classifier_ = nn.ModuleList([
+            self.node_encoder_cls_fc, self.classifier
+        ])
+
+        """
+        Grouping the model's parameters: separating encoder, decoder, and discriminator
+        """
+        self.encoder_params = filter(lambda p: p.requires_grad, self.encoder_.parameters())
+
+        self.decoder_params = filter(lambda p: p.requires_grad, self.decoder_.parameters())
+
+        self.classifier_params = filter(lambda p: p.requires_grad, self.classifier_.parameters())
+
+        self.ae_params = chain(
+            self.word_emb.parameters(), self.encoder_.parameters(), self.decoder_.parameters()
+        )
+        self.ae_params = filter(lambda p: p.requires_grad, self.ae_params)
+
+        """
+        Use GPU if set
+        """
+
+        # for m in self.modules():
+        #     self.weights_init(m)
+
+        self.to(self.device)
+
+    def forward_node_encoder(self, inputs):
+        x = F.relu(self.node_encoder_fc(inputs))
+        x = x.view(-1, self.n_node * self.node_dim)
+        return x
+
+    def forward(self, sentence, mask, classifier):
+
+        mbsize = sentence.size(0)
+
+        enc_inputs = sentence
+        dec_inputs = sentence
+
+        pad_words = torch.LongTensor([self.PAD_IDX]).repeat(mbsize, 1).to(self.device)
+        dec_targets = torch.cat([sentence[:, 1:], pad_words], dim=1)
+
+        # Encoder: sentence -> z
+        z, h = self.forward_encoder(enc_inputs)
+
+        # Generator: z -> node
+        text, attentions, c_loss = self.generate_node(z, h, mask)
+
+        # Node Encoder: node -> z'
+        z1 = self.forward_node_encoder(text)
+        # z1 = text.view(-1, self.n_node * self.node_dim)
+
+        # Decoder: sentence -> y
+        y = self.forward_decoder(dec_inputs, z1)
+
+        recon_loss = F.cross_entropy(y.view(-1, self.n_vocab), dec_targets.view(-1), size_average=True,
+                                     ignore_index=self.PAD_IDX)
+
+        penal1 = torch.distributions.Categorical(probs=attentions).entropy().mean()
+
+        if classifier:
+            # classifier: graph -> prediction
+            outputs = self.classifier(z1)
+
+            return recon_loss, outputs, penal1, c_loss
+        else:
+            return recon_loss, penal1, c_loss
+
+    def forward_classifier(self, inputs, mask):
+
+        # Encoder: sentence -> z
+        z, h = self.forward_encoder(inputs)
+
+        # Generator: z -> node
+        text, _, _ = self.generate_node(z, h, mask)
+
+        # classifier: node -> prediction
+        x = F.relu(self.node_encoder_cls_fc(text))
+        x = x.view(-1, self.n_node * self.node_dim)
+        outputs = self.classifier(x)
+        return outputs
+
+    def train_model(self, args, dataset, logger):
+        """train the whole network"""
+        self.train()
+        self.dataset = dataset
+
+        alpha = args.alpha
+        beta = args.beta
+        lam = args.cls_weight
+        gam = args.recon_weight
+
+        trainer = optim.Adam(self.parameters(), lr=args.lr)
+        criterion_cls = nn.CrossEntropyLoss().to(self.device)
+
+        patience = 0
+        best_val_acc, best_test_acc, best_iter = 0, 0, 0
+        list_loss_recon, list_loss_penal1, list_loss_closs = [], [], []
+        list_loss_cls = []
+        train_start_time = time.time()
+        train_iter = dataset.build_train_iter(args.batch_size, self.device)
+        val_iter, test_iter = dataset.build_test_iter(args.batch_size, self.device, shuffle=False)
+
+        for epoch in range(1, args.epochs):
+
+            for i, subdata in enumerate([train_iter]):
+                for batch in iter(subdata):
+                    inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+                    # mask = dataset.create_mask(inputs, device=self.device)
+
+                    recon_loss, outputs, penal1, closs = self.forward(inputs, mask=mask, classifier=True)
+                    loss_cls = criterion_cls(outputs, labels)
+                    list_loss_cls.append(loss_cls.item())
+                    loss_vae = gam * recon_loss + lam * loss_cls + alpha * penal1 + beta * closs
+
+                    if torch.isnan(loss_vae):
+                        a = 1
+                    list_loss_recon.append(recon_loss.item())
+                    list_loss_penal1.append(penal1.item())
+                    list_loss_closs.append(closs.item())
+
+                    trainer.zero_grad()
+                    loss_vae.backward()
+                    # grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), 10)
+                    trainer.step()
+
+            if epoch % args.log_every == 0:
+                duration = time.time() - train_start_time
+                avr_loss_recon = np.mean(list_loss_recon)
+                avr_loss_penal1 = np.mean(list_loss_penal1)
+                avr_closs = np.mean(list_loss_closs)
+                avr_cls = np.mean(list_loss_cls)
+                list_loss_recon, list_loss_penal1, list_loss_penal2, list_loss_closs = [], [], [], []
+                list_loss_cls = []
+                logger.info(
+                    f'Epoch-{epoch}; loss_recon: {avr_loss_recon:.4f}; loss_cls: {avr_cls:.4f}; penal1: {avr_loss_penal1:.4f}; '
+                    f'avr_closs: {avr_closs:.4f}; duration: {round(duration)}')
+
+                train_acc = self.test(train_iter)
+                val_acc = self.test(val_iter)
+                test_acc = self.test(test_iter)
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_test_acc = test_acc
+                    best_iter = epoch
+                    patience = 0
+                    graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='test')
+                    graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='val')
+                    graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'),
+                                              save_name='train')
+                else:
+                    if epoch > args.minimal_epoch:
+                        patience += args.log_every
+
+                logger.info(
+                    f'Train Acc: {train_acc:.4f}; Valid Acc: {val_acc:.4f}; Test Acc: {test_acc:.4f}; Best Acc: {best_test_acc:.4f} @ {best_iter}')
+
+                if args.early_stop and patience > args.patience:
+                    break
+
+            if epoch % args.save_every == 0:
+                graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='test')
+                graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='val')
+                graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='train')
+
+        logger.info(f'Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_iter}')
+        return best_val_acc, best_test_acc
+
+    def output_graph(self, dataset, data_iter, save_path=None, save_name=''):
+        self.eval()
+        input_list, word_list = [], []
+        with torch.no_grad():
+            for batch in iter(data_iter):
+                inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+
+                z, h = self.forward_encoder(inputs)
+                text, attentions, _ = self.generate_node(z, h, mask)
+                chosen = attentions.argmax(dim=-1).cpu().numpy()
+
+                for ins, ch in zip(inputs.cpu().numpy(), chosen):
+                    ins = [dataset.idx2word(i) for i in ins if i != self.PAD_IDX]
+                    words = [ins[i] for i in ch]
+                    input_list.append(' '.join(ins))
+                    word_list.append(words)
+        self.train()
+
+        if save_path:
+            if not os.path.exists(save_path):
+                os.mkdir(save_path)
+            with open(os.path.join(save_path, f'{save_name}.pickle'), 'wb') as handle:
+                graph = {
+                    'word_list': word_list,
+                    'input_list': input_list
+                }
+                pickle.dump(graph, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            with open(os.path.join(save_path, f'{save_name}.json'), 'w') as handle:
+                graph = {}
+                for idx, (ins, words) in enumerate(zip(input_list, word_list)):
+                    graph[idx] = {'doc':ins, 'keywords':words}
+                json.dump(graph, handle, indent=4)
+
+        return input_list, word_list
+
+
+class NetGenWordS(NetGenWord):
+    def __init__(self, n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout=0.5, unk_idx=0, pad_idx=1,
+                 start_idx=2, eos_idx=3, pretrained_embeddings=None, freeze_embeddings=False, teacher_forcing=True, device=False):
+        super(NetGenWordS, self).__init__(n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout, unk_idx,
+                                          pad_idx, start_idx, eos_idx, pretrained_embeddings, freeze_embeddings, teacher_forcing, device)
+
+        """
+        Classifier is DNN
+        """
+        self.node_encoder_cls_fc_S = nn.Linear(self.node_dim, self.node_dim, bias=False)
+        self.classifier_S = nn.Sequential(
+            nn.Linear(self.node_dim * self.n_node, self.node_dim * self.n_node // 4),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(self.node_dim * self.n_node // 4, self.n_labels)
+        )
+        self.classifierS_ = nn.ModuleList([
+            self.node_encoder_cls_fc_S, self.classifier_S
+        ])
+
+        self.classifierS_params = filter(lambda p: p.requires_grad, self.classifierS_.parameters())
+
+        """
+        Use GPU if set
+        """
+
+        # for m in self.modules():
+        #     self.weights_init(m)
+
+        self.to(self.device)
+
+    def forward_classifierS(self, inputs, mask):
+
+        # Encoder: sentence -> z
+        z, h = self.forward_encoder(inputs)
+
+        # Generator: z -> node
+        text, attentions, _ = self.generate_node(z, h, mask)
+        chosen = attentions.argmax(dim=-1)
+        indices = inputs.gather(dim=1, index=chosen)
+        text = self.dataset.TEXT.vocab.vectors[indices].to(self.device)
+
+        # classifier: node -> prediction
+        x = F.relu(self.node_encoder_cls_fc_S(text))
+        x = x.view(-1, self.n_node * self.node_dim)
+        outputs = self.classifier_S(x)
+        return outputs
+
+    def train_model(self, args, dataset, logger):
+        """train the whole network"""
+        self.train()
+        self.dataset = dataset
+
+        alpha = args.alpha
+        beta = args.beta
+        lam = args.cls_weight
+        gam = args.recon_weight
+
+        trainer = optim.Adam(self.parameters(), lr=args.lr)
+        criterion_cls = nn.CrossEntropyLoss().to(self.device)
+
+        patience = 0
+        best_val_acc, best_test_acc, best_iter = 0, 0, 0
+        list_loss_recon, list_loss_penal1, list_loss_closs = [], [], []
+        list_loss_cls = []
+        train_start_time = time.time()
+        train_iter = dataset.build_train_iter(args.batch_size, self.device)
+        val_iter, test_iter = dataset.build_test_iter(args.batch_size, self.device, shuffle=False)
+
+        for epoch in range(1, args.epochs):
+
+            for i, subdata in enumerate([train_iter]):
+                for batch in iter(subdata):
+                    inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+                    # mask = dataset.create_mask(inputs, device=self.device)
+
+                    recon_loss, outputs, penal1, closs = self.forward(inputs, mask=mask, classifier=True)
+                    loss_cls = criterion_cls(outputs, labels)
+                    list_loss_cls.append(loss_cls.item())
+                    loss_vae = gam * recon_loss + lam * loss_cls + alpha * penal1 + beta * closs
+
+                    if torch.isnan(loss_vae):
+                        a = 1
+                    list_loss_recon.append(recon_loss.item())
+                    list_loss_penal1.append(penal1.item())
+                    list_loss_closs.append(closs.item())
+
+                    trainer.zero_grad()
+                    loss_vae.backward()
+                    # grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), 10)
+                    trainer.step()
+
+            if epoch % args.log_every == 0:
+                duration = time.time() - train_start_time
+                avr_loss_recon = np.mean(list_loss_recon)
+                avr_loss_penal1 = np.mean(list_loss_penal1)
+                avr_closs = np.mean(list_loss_closs)
+                avr_cls = np.mean(list_loss_cls)
+                list_loss_recon, list_loss_penal1, list_loss_penal2, list_loss_closs = [], [], [], []
+                list_loss_cls = []
+                logger.info(
+                    f'Epoch-{epoch}; loss_recon: {avr_loss_recon:.4f}; loss_cls: {avr_cls:.4f}; penal1: {avr_loss_penal1:.4f}; '
+                    f'avr_closs: {avr_closs:.4f}; duration: {round(duration)}')
+
+                train_acc, val_acc, test_acc = self.train_model_classifier(args)
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_test_acc = test_acc
+                    best_iter = epoch
+                    patience = 0
+                    graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='test')
+                    graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='val')
+                    graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'),
+                                              save_name='train')
+                else:
+                    if epoch > args.minimal_epoch:
+                        patience += args.log_every
+
+                logger.info(
+                    f'Train Acc: {train_acc:.4f}; Valid Acc: {val_acc:.4f}; Test Acc: {test_acc:.4f}; Best Acc: {best_test_acc:.4f} @ {best_iter}')
+
+                if args.early_stop and patience > args.patience:
+                    break
+
+            if epoch % args.save_every == 0:
+                graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='test')
+                graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='val')
+                graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='train')
+
+        logger.info(f'Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_iter}')
+        return best_val_acc, best_test_acc
+
+    def train_model_classifier(self, args):
+        """train the whole network"""
+        self.train()
+
+        self.classifierS_[0].reset_parameters()
+        for i in self.classifier_[1]:
+            if hasattr(i, 'reset_parameters'):
+                i.reset_parameters()
+        trainer_C = optim.Adam(filter(lambda p: p.requires_grad, self.classifierS_.parameters()), lr=args.eval_lr)
+        criterion_cls = nn.CrossEntropyLoss().to(self.device)
+
+        patience = 0
+        log_every = 5
+        list_loss_cls = []
+        best_train_acc, best_val_acc, best_test_acc, best_iter = 0, 0, 0, 0
+        train_start_time = time.time()
+
+        train_iter = self.dataset.build_train_iter(args.eval_batch_size, self.device)
+        val_iter, test_iter = self.dataset.build_test_iter(args.batch_size, self.device)
+
+        for epoch in range(1, args.eval_epochs):
+            for batch in iter(train_iter):
+                inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+
+                """ Update classifier """
+                outputs = self.forward_classifierS(inputs, mask)
+                loss_cls = criterion_cls(outputs, labels)
+                list_loss_cls.append(loss_cls.item())
+
+                trainer_C.zero_grad()
+                loss_cls.backward()
+                trainer_C.step()
+
+            if epoch % log_every == 0:
+                duration = time.time() - train_start_time
+                avr_loss_cls = np.mean(list_loss_cls)
+                list_loss_cls = []
+
+                val_acc = self.test(val_iter)
+                test_acc = self.test(test_iter)
+                train_acc = self.test(train_iter)
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_test_acc = test_acc
+                    best_train_acc = train_acc
+                    best_iter = epoch
+                    patience = 0
+                else:
+                    if epoch > args.eval_minimal_epoch:
+                        patience += log_every
+
+                if args.eval_early_stop and patience > args.eval_patience:
+                    break
+
+            # if epoch % 10 == 0:
+            #     print(f'Epoch-{epoch}; loss_cls: {avr_loss_cls:.4f}; Valid Acc: {val_acc:.4f}; Test Acc: {test_acc:.4f};'
+            #           f' duration: {duration:.2f}')
+
+        # print(f'Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ iter {best_iter}')
+        return best_train_acc, best_val_acc, best_test_acc
+
+    def test(self, data_iter):
+        self.eval()
+        total_accuracy = []
+        with torch.no_grad():
+            for batch in iter(data_iter):
+                inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+                outputs = self.forward_classifierS(inputs, mask)
+                accuracy = (outputs.argmax(1) == labels).float().mean().item()
+                total_accuracy.append(accuracy)
+        acc = sum(total_accuracy) / len(total_accuracy)
+        self.train()
+        return acc

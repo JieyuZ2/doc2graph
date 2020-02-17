@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 
 from src.utils import *
 from src.models import *
-from src.dataset import Yelp_Dataset, DBLP_Dataset, NYnews_Dataset
+from src.dataset import Dataset
 
 
 def parse_args():
@@ -16,22 +16,22 @@ def parse_args():
     # general options
     parser.add_argument('--dataset', type=str, default='dblp', choices=['yelp', 'dblp', 'nyt'])
     parser.add_argument("--embed_path", type=str, default='')
-    parser.add_argument('--model', type=str, default='netgen1', choices=['netgen', 'rnnvae', 'netgen1', 'rnnae'])
+    parser.add_argument('--model', type=str, default='NetGenS', choices=['NetGen', 'NetGenWord', 'NetGenS', 'NetGenWordS'])
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument("--prefix", type=str, default='', help="prefix use as addition directory")
     parser.add_argument('--suffix', default='', type=str, help='suffix append to log dir')
     parser.add_argument('--log_level', default=20)
-    parser.add_argument('--log_every', type=int, default=5, help='log results every epoch.')
-    parser.add_argument('--save_every', type=int, default=50, help='save learned embedding every epoch.')
+    parser.add_argument('--log_every', type=int, default=1, help='log results every epoch.')
+    parser.add_argument('--save_every', type=int, default=10, help='save learned embedding every epoch.')
     parser.add_argument('--tag', type=str, default='')
 
     # training options
-    parser.add_argument('--epochs', type=int, default=500)
+    parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--early_stop', type=int, default=0)
-    parser.add_argument('--minimal_epoch', type=int, default=500)
-    parser.add_argument('--patience', type=int, default=100)
+    parser.add_argument('--minimal_epoch', type=int, default=50)
+    parser.add_argument('--patience', type=int, default=20)
 
     # evaluation options
     parser.add_argument('--eval_epochs', type=int, default=1000)
@@ -41,18 +41,16 @@ def parse_args():
     parser.add_argument('--eval_minimal_epoch', type=int, default=10)
     parser.add_argument('--eval_patience', type=int, default=50)
 
-
     # model options
     parser.add_argument('--embed_dim', type=int, default=100)
     parser.add_argument('--h_dim', type=int, default=100)
     parser.add_argument('--z_dim', type=int, default=100)
     parser.add_argument('--n_node', type=int, default=10)
-    parser.add_argument('--kl_weight', type=float, default=0.1)
-    parser.add_argument('--cls_weight', type=float, default=0.0)
-    parser.add_argument('--alpha', type=float, default=0.01, help='p1')
+    parser.add_argument('--teacher_forcing', type=int, default=1)
+    parser.add_argument('--recon_weight', type=float, default=0.0)
+    parser.add_argument('--cls_weight', type=float, default=1.0)
+    parser.add_argument('--alpha', type=float, default=0.1, help='p1')
     parser.add_argument('--beta', type=float, default=0.1, help='closs')
-    parser.add_argument('--gamma', type=float, default=0.01, help='p2')
-    parser.add_argument('--theta', type=float, default=0.0, help='lloss')
 
     return parser.parse_args()
 
@@ -85,26 +83,21 @@ def main(args):
     start_time = time.time()
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
-    dataset_map = {
-        'yelp': Yelp_Dataset,
-        'dblp': DBLP_Dataset,
-        'nyt': NYnews_Dataset
-    }
-    dataset = dataset_map[args.dataset]()
+    dir_path = os.path.dirname(os.path.realpath(__file__))
+    parent_path = os.path.abspath(os.path.join(dir_path, os.pardir))
+    data_file = os.path.join(parent_path, f'data/{args.dataset}.txt')
+
+    include_all = args.model[-1] == 'S'
+    dataset = Dataset(emb_dim=args.embed_dim, data_file=data_file, include_all=include_all)
     args.n_labels = dataset.n_labels
 
     logger = init_logger(args)
     logger.info(f'[TAG]: {args.tag}')
     print_config(args, logger)
 
-    if args.model == 'netgen1':
-        model = NetGen1(args.n_node, dataset.n_vocab, args.n_labels, args.embed_dim, args.h_dim, args.z_dim,
-                       pretrained_embeddings=None, freeze_embeddings=False, device=device)
-    elif args.model == 'netgen':
-        model = NetGen(args.n_node, dataset.n_vocab, args.n_labels, args.embed_dim, args.h_dim, args.z_dim,
-                       pretrained_embeddings=None, freeze_embeddings=False, device=device)
-    else:
-        raise NotImplementedError(f'the model {args.model} is not implemented!')
+    model = eval(args.model)(args.n_node, dataset.n_vocab, args.n_labels, args.embed_dim, args.h_dim, args.z_dim,
+                             pretrained_embeddings=None, freeze_embeddings=False, teacher_forcing=args.teacher_forcing,
+                             device=device)
 
     try:
         model.train_model(args, dataset, logger)

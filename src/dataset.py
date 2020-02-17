@@ -7,19 +7,30 @@ import torch
 from torchtext import data, datasets
 from torchtext.vocab import Vectors, GloVe
 
-from src.nytimes import NYnews
-from src.dblp import DBLP
-from src.yelp import Yelp
-
 stopwords_ = set(stopwords.words('english'))
 ignore_ = list(stopwords_) + list(punctuation_)
 
 
 class Dataset:
-    def __init__(self, emb_dim):
-        self.TEXT.build_vocab(self.train)
-        self.LABEL.build_vocab(self.train)
-        self.MASK.build_vocab(self.train)
+    def __init__(self, emb_dim, data_file, include_all=False):
+        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
+        self.LABEL = data.Field(sequential=False, unk_token=None)
+        self.MASK = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
+
+        f = lambda ex: len(ex.text) >= 10 and len(ex.text) <= 500
+
+        self.train, self.val, self.test, self.all = Dataset_.splits(self.TEXT, self.LABEL, self.MASK, root=data_file,
+                                                                    filter_pred=f, include_all=include_all)
+
+        if include_all:
+            self.TEXT.build_vocab(self.all, vectors=GloVe('6B', dim=emb_dim))
+            self.LABEL.build_vocab(self.all)
+            self.MASK.build_vocab(self.all)
+        else:
+            self.TEXT.build_vocab(self.train)
+            self.LABEL.build_vocab(self.train)
+            self.MASK.build_vocab(self.train)
+
         self.MASK.vocab.stoi = defaultdict(lambda:1)
         for s in [self.MASK.unk_token, self.MASK.pad_token, self.MASK.init_token, self.MASK.eos_token]:
             self.MASK.vocab.stoi[s] = 0
@@ -46,11 +57,11 @@ class Dataset:
             mask[inputs == ele] = 0
         return mask
 
-    def build_data_iter(self, batch_size=128, device=-1):
-        train_iter = data.BucketIterator(
-            self.train, batch_size=batch_size, device=device, shuffle=True, repeat=False
+    def build_all_iter(self, batch_size=128, device=-1):
+        all_iter = data.BucketIterator(
+            self.all, batch_size=batch_size, device=device, shuffle=True, repeat=False
         )
-        return train_iter
+        return all_iter
 
     def build_train_iter(self, batch_size=128, device=-1):
         train_iter = data.BucketIterator(
@@ -67,13 +78,6 @@ class Dataset:
     def get_vocab_vectors(self):
         return self.TEXT.vocab.vectors
 
-    def get_batch(self, iter_, gpu=False):
-        for batch in iter_:
-            if gpu:
-                yield batch.text.cuda(), batch.label.cuda()
-            else:
-                yield batch.text, batch.label
-
     def idx2word(self, idx):
         return self.TEXT.vocab.itos[idx]
 
@@ -83,58 +87,66 @@ class Dataset:
     def idx2label(self, idx):
         return self.LABEL.vocab.itos[idx]
 
-
-class NYnews_Dataset(Dataset):
-    def __init__(self, emb_dim=100):
-        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
-        self.LABEL = data.Field(sequential=False, unk_token=None)
-        self.MASK = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
-
-        f = lambda ex: len(ex.text) >= 10 and len(ex.text) <= 500
-
-        self.train, self.val, self.test = NYnews.splits(self.TEXT, self.LABEL, self.MASK, filter_pred=f)
-
-        super(NYnews_Dataset, self).__init__(emb_dim)
+    def get_batch(self, iter_, gpu=False):
+        for batch in iter_:
+            if gpu:
+                yield batch.text.cuda(), batch.label.cuda()
+            else:
+                yield batch.text, batch.label
 
 
-class Yelp_Dataset(Dataset):
-    def __init__(self, emb_dim=100):
-        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
-        self.LABEL = data.Field(sequential=False, unk_token=None)
-        self.MASK = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
+class Dataset_(data.Dataset):
 
-        f = lambda ex: len(ex.text) >= 10 and len(ex.text) <= 200
+    @staticmethod
+    def sort_key(ex):
+        return len(ex.text)
 
-        self.train, self.val, self.test = DBLP.splits(self.TEXT, self.LABEL, self.MASK, filter_pred=f)
+    def __init__(self, path, text_field, label_field, mask_field, data_list, **kwargs):
 
-        super(Yelp_Dataset, self).__init__(emb_dim)
+        fields = [('text', text_field), ('label', label_field), ('mask', mask_field)]
+        examples = []
 
+        for data_tuple in data_list:
+            label, text = data_tuple[0], data_tuple[1]
+            examples.append(data.Example.fromlist([text, label, text], fields))
 
-class DBLP_Dataset(Dataset):
-    def __init__(self, emb_dim=100):
-        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
-        self.LABEL = data.Field(sequential=False, unk_token=None)
-        self.MASK = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
+        super(Dataset_, self).__init__(examples, fields, **kwargs)
 
-        f = lambda ex: len(ex.text) >= 10 and len(ex.text) <= 200
+    @classmethod
+    def splits(cls, text_field, label_field, mask_field, root, split_ratio=(0.8, 0.1), include_all=False, **kwargs):
+        raw_data = []
 
-        self.train, self.val, self.test = DBLP.splits(self.TEXT, self.LABEL, self.MASK, filter_pred=f)
+        with open(root, 'r') as f:
+            for line in f:
+                label, text = line.strip().split('\t ')
+                label = int(label)
+                raw_data.append((label, text))
 
-        super(DBLP_Dataset, self).__init__(emb_dim)
+        train_sample_num = round(len(raw_data)*split_ratio[0])
+        val_sample_num = round(len(raw_data)*split_ratio[1]) + train_sample_num
+        train_raw_data = raw_data[0:train_sample_num]
+        val_raw_data = raw_data[train_sample_num:val_sample_num]
+        test_raw_data = raw_data[val_sample_num:]
+        train_data = cls(path=root,  text_field=text_field, label_field=label_field, mask_field=mask_field, data_list=train_raw_data, **kwargs)
+        val_data = cls(path=root,  text_field=text_field, label_field=label_field, mask_field=mask_field, data_list=val_raw_data, **kwargs)
+        test_data = cls(path=root, text_field=text_field, label_field=label_field, mask_field=mask_field, data_list=test_raw_data, **kwargs)
 
+        if include_all:
+            all_data = cls(path=root, text_field=text_field, label_field=label_field, mask_field=mask_field, data_list=raw_data, **kwargs)
+            return (train_data, val_data, test_data, all_data)
+        else:
+            return (train_data, val_data, test_data, None)
 
-class SST_Dataset(Dataset):
-    def __init__(self, emb_dim=100):
-        self.TEXT = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
-        self.LABEL = data.Field(sequential=False, unk_token=None)
-        self.MASK = data.Field(init_token='<start>', eos_token='<eos>', lower=True, tokenize='spacy')
+    @classmethod
+    def iters(cls, batch_size=32, device=0, root='.data', vectors=None, **kwargs):
+        TEXT = data.Field()
+        LABEL = data.Field(sequential=False)
 
-        # Only take sentences with length <= 15
-        # f = lambda ex: ex.label != 'neutral' and len(ex.text) >= 20
-        f = lambda ex: len(ex.text) >= 10 and len(ex.text) <= 100
+        train, val, test = cls.splits(TEXT, LABEL, root=root, **kwargs)
 
-        self.train, self.val, self.test = SST.splits(
-            self.TEXT, self.LABEL, self.MASK, fine_grained=False, train_subtrees=False, filter_pred=f
-        )
+        TEXT.build_vocab(train, vectors=vectors)
+        LABEL.build_vocab(train)
 
-        super(SST_Dataset, self).__init__(emb_dim)
+        return data.BucketIterator.splits(
+            (train, val, test), batch_size=batch_size, device=device)
+
