@@ -484,6 +484,320 @@ class NetGen(AbstractNetGen):
         self.graph_encoder_cls = GraphConvolution(self.node_dim, self.node_dim, bias=False)
         self.graph_encoder_cls_fc = nn.Linear(2 * self.node_dim, self.node_dim, bias=False)
         self.classifier = nn.Sequential(
+            nn.Linear(self.node_dim, self.node_dim// 4),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(self.node_dim // 4, self.n_labels)
+        )
+        self.classifier_ = nn.ModuleList([
+            self.graph_encoder_cls, self.graph_encoder_cls_fc, self.classifier
+        ])
+
+        """
+        Grouping the model's parameters: separating encoder, decoder, and discriminator
+        """
+        self.encoder_params = filter(lambda p: p.requires_grad, self.encoder_.parameters())
+
+        self.decoder_params = filter(lambda p: p.requires_grad, self.decoder_.parameters())
+
+        self.classifier_params = filter(lambda p: p.requires_grad, self.classifier_.parameters())
+
+        self.ae_params = chain(
+            self.word_emb.parameters(), self.encoder_.parameters(), self.decoder_.parameters()
+        )
+        self.ae_params = filter(lambda p: p.requires_grad, self.ae_params)
+
+        """
+        Use GPU if set
+        """
+
+        # for m in self.modules():
+        #     self.weights_init(m)
+
+        self.to(self.device)
+
+    def forward_graph_encoder(self, inputs, adj):
+        # x = F.relu(self.graph_encoder(input, adj))
+        x = self.graph_encoder(inputs, adj)
+        x = F.relu(self.graph_encoder_fc(torch.cat((x, inputs), -1)))
+        x = x.view(-1, self.n_node * self.node_dim)
+        # x = self.graph_encoder_trans(x)
+
+        return x
+
+    def forward(self, sentence, mask, classifier):
+        """
+        Params:
+        -------
+        sentence: sequence of word indices.
+        use_c_prior: whether to sample `c` from prior or from `discriminator`.
+
+        Returns:
+        --------
+        recon_loss: reconstruction loss of VAE.
+        kl_loss: KL-div loss of VAE.
+        """
+
+        mbsize = sentence.size(0)
+
+        enc_inputs = sentence
+        dec_inputs = sentence
+
+        pad_words = torch.LongTensor([self.PAD_IDX]).repeat(mbsize, 1).to(self.device)
+        dec_targets = torch.cat([sentence[:, 1:], pad_words], dim=1)
+
+        # Encoder: sentence -> z
+        z, h = self.forward_encoder(enc_inputs)
+
+        # Generator: z -> node
+        text, attentions, c_loss = self.generate_node(z, h, mask)
+
+        # Generator: z -> adj
+        adj = self.generate_adjacency_matrix(h)
+
+        # Graph Encoder: graph -> z'
+        z1 = self.forward_graph_encoder(text, adj)
+        # z1 = text.view(-1, self.n_node * self.node_dim)
+
+        # Decoder: sentence -> y
+        y = self.forward_decoder(dec_inputs, z1)
+
+        recon_loss = F.cross_entropy(y.view(-1, self.n_vocab), dec_targets.view(-1), size_average=True, ignore_index=self.PAD_IDX)
+
+        penal1 = torch.distributions.Categorical(probs=attentions).entropy().mean()
+
+        if classifier:
+            # classifier: graph -> prediction
+            x = self.graph_encoder_cls(text, adj)
+            x = F.relu(self.graph_encoder_cls_fc(torch.cat((x, text), -1)))
+            # x = x.view(-1, self.node_dim * self.n_node)
+            x = x.sum(dim=1)
+            outputs = self.classifier(x)
+
+            return recon_loss, outputs, penal1, c_loss
+        else:
+            return recon_loss, penal1, c_loss
+
+    def forward_classifier(self, inputs, mask):
+
+        # Encoder: sentence -> z
+        z, h = self.forward_encoder(inputs)
+
+        # Generator: z -> node
+        text, _, _ = self.generate_node(z, h, mask)
+
+        # Generator: z -> adj
+        adj = self.generate_adjacency_matrix(h)
+
+        # classifier: graph -> prediction
+        x = self.graph_encoder_cls(text, adj)
+        x = F.relu(self.graph_encoder_cls_fc(torch.cat((x, text), -1)))
+        # x = x.view(-1, self.node_dim * self.n_node)
+        x = x.sum(dim=1)
+        outputs = self.classifier(x)
+        return outputs
+
+    def generate_adjacency_matrix(self, hidden_state):
+        adj = self.generate_adj(torch.cat(hidden_state, dim=-1))
+        b_size = adj.size()[1]
+        adj = adj.view(b_size, self.n_node, self.n_node)
+
+        return adj
+
+    def generate_graph(self, z, hidden_state, mask):
+        node, attentions, _ = self.generate_node(z, hidden_state, mask)
+        adj = self.generate_adjacency_matrix(hidden_state)
+        return node, adj, attentions
+
+    def train_model(self, args, dataset, logger):
+        """train the whole network"""
+        self.train()
+        self.dataset = dataset
+
+        alpha = args.alpha
+        beta = args.beta
+        lam = args.cls_weight
+        gam = args.recon_weight
+
+        trainer = optim.Adam(self.parameters(), lr=args.lr)
+        criterion_cls = nn.CrossEntropyLoss().to(self.device)
+
+        patience = 0
+        best_val_acc, best_test_acc, best_iter = 0, 0, 0
+        list_loss_recon, list_loss_penal1, list_loss_closs = [], [], []
+        list_loss_cls = []
+        train_start_time = time.time()
+        train_iter = dataset.build_train_iter(args.batch_size, self.device)
+        val_iter, test_iter = dataset.build_test_iter(args.batch_size, self.device, shuffle=False)
+
+        for epoch in range(1, args.epochs):
+
+            for i, subdata in enumerate([train_iter]):
+                for batch in iter(subdata):
+                    inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+                    # mask = dataset.create_mask(inputs, device=self.device)
+
+                    recon_loss, outputs, penal1, closs = self.forward(inputs, mask=mask, classifier=True)
+                    loss_cls = criterion_cls(outputs, labels)
+                    list_loss_cls.append(loss_cls.item())
+                    loss_vae = gam * recon_loss + lam * loss_cls + alpha * penal1 + beta * closs
+
+                    list_loss_recon.append(recon_loss.item())
+                    list_loss_penal1.append(penal1.item())
+                    list_loss_closs.append(closs.item())
+
+                    trainer.zero_grad()
+                    loss_vae.backward()
+                    # grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), 10)
+                    trainer.step()
+
+            if epoch % args.log_every == 0:
+                duration = time.time() - train_start_time
+                avr_loss_recon = np.mean(list_loss_recon)
+                avr_loss_penal1 = np.mean(list_loss_penal1)
+                avr_closs = np.mean(list_loss_closs)
+                avr_cls = np.mean(list_loss_cls)
+                list_loss_recon, list_loss_penal1, list_loss_penal2, list_loss_closs = [], [], [], []
+                list_loss_cls = []
+                logger.info(f'Epoch-{epoch}; loss_recon: {avr_loss_recon:.4f}; loss_cls: {avr_cls:.4f}; penal1: {avr_loss_penal1:.4f}; '
+                            f'avr_closs: {avr_closs:.4f}; duration: {round(duration)}')
+
+                train_acc, train_loss = self.test(train_iter)
+                val_acc, val_loss = self.test(val_iter)
+                test_acc, test_loss = self.test(test_iter)
+                loss_ratio = test_loss/train_loss
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_test_acc = test_acc
+                    best_iter = epoch
+                    best_loss_ratio = loss_ratio
+                    patience = 0
+                    graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='test')
+                    graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='val')
+                    graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='train')
+                else:
+                    if epoch > args.minimal_epoch:
+                        patience += args.log_every
+
+                logger.info(f'loss ratio: {loss_ratio:.4f} Train Acc: {train_acc:.4f}; '
+                            f'Valid Acc: {val_acc:.4f}; Test Acc: {test_acc:.4f}; '
+                            f'Best Acc: {best_test_acc:.4f} Best loss ratio: {best_loss_ratio:.4f} @ {best_iter}')
+
+                if args.early_stop and patience > args.patience:
+                    break
+
+            if epoch % args.save_every == 0:
+                graph = self.output_graph(dataset, test_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='test')
+                graph = self.output_graph(dataset, val_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='val')
+                graph = self.output_graph(dataset, train_iter, os.path.join(args.log_dir, f'epoch_{epoch}'), save_name='train')
+
+        logger.info(f'Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_iter}')
+        return best_val_acc, best_test_acc
+
+    def output_graph(self, dataset, data_iter, save_path=None, save_name=''):
+        self.eval()
+        input_list, adj_list, word_list = [], [], []
+        with torch.no_grad():
+            for batch in iter(data_iter):
+                inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+
+                z, h = self.forward_encoder(inputs)
+                text, adj, attentions = self.generate_graph(z, h, mask)
+                chosen = attentions.argmax(dim=-1).cpu().numpy()
+
+                for ins, ch in zip(inputs.cpu().numpy(), chosen):
+                    ins = [dataset.idx2word(i) for i in ins if i != self.PAD_IDX]
+                    words = [ins[i] for i in ch]
+                    input_list.append(' '.join(ins))
+                    word_list.append(words)
+                adj_list.append(adj.cpu().numpy())
+        adj_list = np.concatenate(adj_list, axis=0)
+        self.train()
+
+        if save_path:
+            if not os.path.exists(save_path):
+                os.mkdir(save_path)
+            with open(os.path.join(save_path, f'{save_name}.pickle'), 'wb') as handle:
+                graph = {
+                    'adj_list': adj_list,
+                    'word_list': word_list,
+                    'input_list': input_list
+                }
+                pickle.dump(graph, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            with open(os.path.join(save_path, f'{save_name}.json'), 'w') as handle:
+                graph = {}
+                for idx, (ins, words) in enumerate(zip(input_list, word_list)):
+                    graph[idx] = {'doc':ins, 'keywords':words}
+                json.dump(graph, handle, indent=4)
+
+        return input_list, word_list, adj_list
+
+
+class NetGen1(AbstractNetGen):
+    def __init__(self, n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout=0.5, unk_idx=0, pad_idx=1, start_idx=2,
+                 eos_idx=3, pretrained_embeddings=None, freeze_embeddings=False, teacher_forcing=True, device=False):
+        super(NetGen1, self).__init__(n_node, n_vocab, n_labels, embed_dim, p_word_dropout, unk_idx, pad_idx, start_idx, eos_idx,
+                                     pretrained_embeddings, freeze_embeddings, teacher_forcing, device)
+
+        self.node_dim = 2 * h_dim
+
+        """
+        Encoder is GRU with FC layers connected to last hidden unit
+        """
+        self.encoder = nn.LSTM(self.emb_dim, h_dim, bidirectional=True, batch_first=True)
+        self.encoder_fc_c = nn.Linear(self.node_dim, h_dim)
+        self.encoder_fc_h = nn.Linear(self.node_dim, h_dim)
+        self.encoder_ = nn.ModuleList([
+            self.encoder, self.encoder_fc_c, self.encoder_fc_h
+        ])
+
+        """
+        Decoder is GRU with `z` appended at its inputs
+        """
+        self.decoder_h_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
+        self.decoder_c_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
+        self.decoder_d_linear = nn.Linear(self.n_node * self.node_dim, z_dim)
+        self.decoder = nn.LSTM(self.emb_dim + z_dim, z_dim, num_layers=1, dropout=0.3, batch_first=True)
+        # self.decoder_fc = nn.Linear(n_node * self.emb_dim, n_vocab)
+        self.decoder_fc = nn.Linear(z_dim, self.n_vocab)
+
+        """
+        Generator 
+        """
+        self.generate_lstm = nn.LSTM(self.node_dim, h_dim, batch_first=True)
+        self.attention_network = Attention(self.node_dim)
+        self.generate_adj = nn.Sequential(
+            nn.Linear(h_dim * 2, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, self.n_node * self.n_node),
+            nn.Sigmoid()
+        )
+        h_matrix = torch.zeros(self.n_node, self.n_node)
+        for i in range(self.n_node):
+            for j in range(i+1, self.n_node):
+                h_matrix[i][j] = 1
+        self.h_matrix = h_matrix.to(self.device)
+        self.i_matrix = torch.eye(self.n_node, self.n_node).to(self.device)
+
+        """
+        Graph Encoder is GCN with pooling layer
+        """
+        self.graph_encoder = GraphConvolution(self.node_dim, self.node_dim, bias=False)
+        self.graph_encoder_fc = nn.Linear(2 * self.node_dim, self.node_dim, bias=False)
+        self.decoder_ = nn.ModuleList([
+            self.decoder, self.decoder_fc, self.decoder_c_linear, self.decoder_h_linear, self.decoder_d_linear,
+            self.attention_network,
+            self.generate_lstm, self.generate_adj,
+            self.graph_encoder, self.graph_encoder_fc
+        ])
+
+        """
+        Classifier is DNN
+        """
+        self.graph_encoder_cls = GraphConvolution(self.node_dim, self.node_dim, bias=False)
+        self.graph_encoder_cls_fc = nn.Linear(2 * self.node_dim, self.node_dim, bias=False)
+        self.classifier = nn.Sequential(
             nn.Linear(self.node_dim * self.n_node, self.node_dim * self.n_node // 4),
             nn.ReLU(),
             nn.Dropout(0.5),
@@ -601,6 +915,8 @@ class NetGen(AbstractNetGen):
         adj = self.generate_adj(torch.cat(hidden_state, dim=-1))
         b_size = adj.size()[1]
         adj = adj.view(b_size, self.n_node, self.n_node)
+        adj = adj * self.h_matrix
+        adj = adj + adj.transpose(1, 2) + self.i_matrix
 
         return adj
 
@@ -788,10 +1104,10 @@ class NetGenLink(AbstractNetGen):
         self.graph_encoder_cls = GraphConvolution(self.node_dim, self.node_dim, bias=False)
         self.graph_encoder_cls_fc = nn.Linear(2 * self.node_dim, self.node_dim, bias=False)
         self.classifier = nn.Sequential(
-            nn.Linear(self.node_dim * self.n_node, self.node_dim * self.n_node // 4),
+            nn.Linear(self.node_dim, self.node_dim // 4),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(self.node_dim * self.n_node // 4, self.n_labels)
+            nn.Linear(self.node_dim // 4, self.n_labels)
         )
         self.classifier_ = nn.ModuleList([
             self.graph_encoder_cls, self.graph_encoder_cls_fc, self.classifier
@@ -878,8 +1194,8 @@ class NetGenLink(AbstractNetGen):
             # classifier: graph -> prediction
             x = self.graph_encoder_cls(text, adj)
             x = F.relu(self.graph_encoder_cls_fc(torch.cat((x, text), -1)))
-            # x = text
-            x = x.view(-1, self.node_dim * self.n_node)
+            # x = x.view(-1, self.node_dim * self.n_node)
+            x = x.sum(dim=1)
             outputs = self.classifier(x)
 
             return recon_loss, outputs
@@ -900,8 +1216,8 @@ class NetGenLink(AbstractNetGen):
         # classifier: graph -> prediction
         x = self.graph_encoder_cls(text, adj)
         x = F.relu(self.graph_encoder_cls_fc(torch.cat((x, text), -1)))
-        # x = text
-        x = x.view(-1, self.node_dim * self.n_node)
+        # x = x.view(-1, self.node_dim * self.n_node)
+        x = x.sum(dim=1)
         outputs = self.classifier(x)
         return outputs
 
@@ -1040,10 +1356,10 @@ class NetGenWord(AbstractNetGen):
         """
         self.node_encoder_cls_fc = nn.Linear(self.node_dim, self.node_dim, bias=False)
         self.classifier = nn.Sequential(
-            nn.Linear(self.node_dim * self.n_node, self.node_dim * self.n_node // 4),
+            nn.Linear(self.node_dim, self.node_dim // 4),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(self.node_dim * self.n_node // 4, self.n_labels)
+            nn.Linear(self.node_dim // 4, self.n_labels)
         )
         self.classifier_ = nn.ModuleList([
             self.node_encoder_cls_fc, self.classifier
@@ -1108,7 +1424,8 @@ class NetGenWord(AbstractNetGen):
         if classifier:
             # classifier: graph -> prediction
             x = F.relu(self.node_encoder_cls_fc(text))
-            x = x.view(-1, self.n_node * self.node_dim)
+            # x = x.view(-1, self.n_node * self.node_dim)
+            x = x.sum(dim=1)
             outputs = self.classifier(x)
 
             return recon_loss, outputs, penal1, c_loss
@@ -1125,7 +1442,8 @@ class NetGenWord(AbstractNetGen):
 
         # classifier: node -> prediction
         x = F.relu(self.node_encoder_cls_fc(text))
-        x = x.view(-1, self.n_node * self.node_dim)
+        # x = x.view(-1, self.n_node * self.node_dim)
+        x = x.sum(dim=1)
         outputs = self.classifier(x)
         return outputs
 
