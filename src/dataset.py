@@ -2,6 +2,7 @@ import os
 from collections import defaultdict
 from string import punctuation as punctuation_
 import nltk
+import random
 from nltk.corpus import stopwords
 import torch
 from torchtext import data, datasets
@@ -121,6 +122,7 @@ class Dataset_(data.Dataset):
                 label, text = line.strip().split('\t ')
                 label = int(label)
                 raw_data.append((label, text))
+                random.shuffle(raw_data)
 
         train_sample_num = round(len(raw_data)*split_ratio[0])
         val_sample_num = round(len(raw_data)*split_ratio[1]) + train_sample_num
