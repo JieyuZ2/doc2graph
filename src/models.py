@@ -1057,7 +1057,9 @@ class NetGenWord(AbstractNetGen):
 
         if classifier:
             # classifier: graph -> prediction
-            outputs = self.classifier(z1)
+            x = F.relu(self.node_encoder_cls_fc(text))
+            x = x.view(-1, self.n_node * self.node_dim)
+            outputs = self.classifier(x)
 
             return recon_loss, outputs, penal1, c_loss
         else:
@@ -1209,12 +1211,12 @@ class NetGenWordS(NetGenWord):
         """
         Classifier is DNN
         """
-        self.node_encoder_cls_fc_S = nn.Linear(self.node_dim, self.node_dim, bias=False)
+        self.node_encoder_cls_fc_S = nn.Linear(self.emb_dim, self.emb_dim, bias=False)
         self.classifier_S = nn.Sequential(
-            nn.Linear(self.node_dim * self.n_node, self.node_dim * self.n_node // 4),
+            nn.Linear(self.emb_dim * self.n_node, self.emb_dim * self.n_node // 4),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(self.node_dim * self.n_node // 4, self.n_labels)
+            nn.Linear(self.emb_dim * self.n_node // 4, self.n_labels)
         )
         self.classifierS_ = nn.ModuleList([
             self.node_encoder_cls_fc_S, self.classifier_S
@@ -1244,7 +1246,7 @@ class NetGenWordS(NetGenWord):
 
         # classifier: node -> prediction
         x = F.relu(self.node_encoder_cls_fc_S(text))
-        x = x.view(-1, self.n_node * self.node_dim)
+        x = x.view(-1, self.n_node * self.emb_dim)
         outputs = self.classifier_S(x)
         return outputs
 

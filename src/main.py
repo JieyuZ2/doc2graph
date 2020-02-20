@@ -14,9 +14,9 @@ from src.dataset import Dataset
 def parse_args():
     parser = argparse.ArgumentParser()
     # general options
-    parser.add_argument('--dataset', type=str, default='dblp', choices=['yelp', 'dblp', 'nyt'])
+    parser.add_argument('--dataset', type=str, default='nyt', choices=['yelp', 'dblp', 'nyt'])
     parser.add_argument("--embed_path", type=str, default='')
-    parser.add_argument('--model', type=str, default='NetGenS', choices=['NetGen', 'NetGenWord', 'NetGenS', 'NetGenWordS'])
+    parser.add_argument('--model', type=str, default='NetGenWordS', choices=['NetGen', 'NetGenWord', 'NetGenS', 'NetGenWordS'])
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument("--prefix", type=str, default='', help="prefix use as addition directory")
     parser.add_argument('--suffix', default='', type=str, help='suffix append to log dir')
@@ -29,9 +29,9 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--early_stop', type=int, default=0)
+    parser.add_argument('--early_stop', type=int, default=1)
     parser.add_argument('--minimal_epoch', type=int, default=50)
-    parser.add_argument('--patience', type=int, default=20)
+    parser.add_argument('--patience', type=int, default=50)
 
     # evaluation options
     parser.add_argument('--eval_epochs', type=int, default=1000)
