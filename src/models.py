@@ -1409,3 +1409,413 @@ class NetGenWordS(NetGenWord):
         acc = sum(total_accuracy) / len(total_accuracy)
         self.train()
         return acc
+
+
+
+
+
+
+
+class LSTMAE(nn.Module):
+    def __init__(self, n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout=0.5, unk_idx=0, pad_idx=1, start_idx=2,
+                 eos_idx=3, pretrained_embeddings=None, freeze_embeddings=False, device=False):
+        super(LSTMAE, self).__init__()
+
+        self.UNK_IDX = unk_idx
+        self.PAD_IDX = pad_idx
+        self.START_IDX = start_idx
+        self.EOS_IDX = eos_idx
+
+        self.n_vocab = n_vocab
+        self.n_labels = n_labels
+        self.h_dim = h_dim
+        self.p_word_dropout = p_word_dropout
+
+        self.device = device
+
+
+        """
+        Word embeddings layer
+        """
+        if pretrained_embeddings is None:
+            self.emb_dim = embed_dim
+            self.word_emb = nn.Embedding(n_vocab, embed_dim, self.PAD_IDX)
+        else:
+            print("use random init emb.")
+            sys.exit(1)
+            self.emb_dim = pretrained_embeddings.size(1)
+            self.word_emb = nn.Embedding(n_vocab, self.emb_dim, self.PAD_IDX)
+
+            # Set pretrained embeddings
+            self.word_emb.weight.data.copy_(pretrained_embeddings)
+
+            if freeze_embeddings:
+                self.word_emb.weight.requires_grad = False
+
+
+        """
+        Encoder is GRU with FC layers connected to last hidden unit
+        """
+        self.encoder = nn.LSTM(self.emb_dim, h_dim, batch_first=True)
+
+        """
+        Decoder is GRU with `z` appended at its inputs
+        """
+
+        self.decoder = nn.LSTM(self.emb_dim + z_dim, z_dim, num_layers=1, dropout=0.3, batch_first=True)
+        self.decoder_fc = nn.Linear(z_dim, self.n_vocab)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(h_dim, h_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(h_dim // 2, self.n_labels)
+        )
+
+        self.to(self.device)
+
+    def forward(self, sentences):
+        inputs = self.word_emb(sentences)
+        z, (hn, cn) = self.encoder(inputs)
+        inputs_emb = self.word_emb(sentences)
+        hidden_z = torch.cat([inputs_emb, z], -1)
+        outputs, _ = self.decoder(hidden_z)
+        outputs = F.relu(outputs)
+        y = self.decoder_fc(outputs)
+        return y
+
+
+
+
+    def train_model(self, args, dataset, logger):
+        self.train()
+        self.dataset = dataset
+        best_train_acc, best_val_acc, best_test_acc, best_test_epoch = 0, 0, 0, 0
+        trainer_ae = optim.Adam(itertools.chain(self.encoder.parameters(), self.decoder.parameters()), lr=args.lr)
+        trainer_cls = optim.Adam(self.classifier.parameters(), lr=args.lr)
+
+        train_iter = dataset.build_train_iter(args.batch_size, self.device)
+        val_iter, test_iter = dataset.build_test_iter(args.batch_size, self.device, shuffle=False)
+
+        for epoch in range(1, args.epochs):
+            for i, subdata in enumerate([train_iter]):
+                for batch in iter(subdata):
+                    sentences, labels = batch.text.t(), batch.label
+                    trainer_ae.zero_grad()
+                    #### TODO: why do this?
+                    mbsize = sentences.size(0)
+                    pad_words = torch.LongTensor([self.PAD_IDX]).repeat(mbsize, 1).to(self.device)
+                    dec_targets = torch.cat([sentences[:, 1:], pad_words], dim=1)
+                    ##############################
+                    pred = self.forward(sentences)
+                    loss = F.cross_entropy(pred.view(-1, self.n_vocab), dec_targets.view(-1), size_average=True, ignore_index=self.PAD_IDX)
+                    loss.backward() # reconstruction loss
+                    trainer_ae.step()
+
+
+            if epoch % args.log_every == 0:
+                # TODO: train classifer in here
+                self.train_classifer(args, train_iter, trainer_cls)
+                train_acc = self.test(train_iter)
+                val_acc = self.test(val_iter)
+                test_acc = self.test(test_iter)
+                if train_acc > best_train_acc:
+                    best_train_acc = train_acc
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                if test_acc > best_test_acc:
+                    best_test_acc = test_acc
+                    best_test_epoch = epoch
+
+                print(f'Train Acc: {train_acc:.4f}; Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_test_epoch}')
+
+        logger.info(
+            f'Best Train Acc: {best_train_acc:.4f}; Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_test_epoch}')
+        return best_val_acc, best_test_acc
+
+
+    def train_classifer(self, args, train_iter, trainer_cls):
+        for epoch in range(args.cls_epochs):
+            for i, subdata in enumerate([train_iter]):
+                for batch in iter(subdata):
+                    sentences, labels = batch.text.t(), batch.label
+                    trainer_cls.zero_grad()
+                    inputs = self.word_emb(sentences)
+                    z, (hn, cn) = self.encoder(inputs)
+                    hn = hn.detach()
+                    final_output = self.classifier(hn[-1])
+                    pred = F.log_softmax(final_output, dim=1)
+                    loss = F.nll_loss(pred, labels)
+                    loss.backward()
+                    # TODO: check whether encoder and decoder have grad
+                    trainer_cls.step()
+
+
+    def test(self, data_iter):
+        self.eval()
+        total_accuracy = []
+        with torch.no_grad():
+            for batch in iter(data_iter):
+                inputs, labels = batch.text.t(), batch.label
+                inputs = self.word_emb(inputs)
+                z, (hn, cn) = self.encoder(inputs)
+                final_output = self.classifier(hn[-1])
+                accuracy = (final_output.argmax(1) == labels).float().mean().item()
+                total_accuracy.append(accuracy)
+        acc = sum(total_accuracy) / len(total_accuracy)
+        self.train()
+        return acc
+
+
+
+class LSTMClassifer(nn.Module):
+    def __init__(self, n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout=0.5, unk_idx=0, pad_idx=1,
+                 start_idx=2, eos_idx=3, pretrained_embeddings=None, freeze_embeddings=False, teacher_forcing=True, device=False):
+        super(LSTMClassifer, self).__init__()
+
+        self.UNK_IDX = unk_idx
+        self.PAD_IDX = pad_idx
+        self.START_IDX = start_idx
+        self.EOS_IDX = eos_idx
+
+        self.n_vocab = n_vocab
+        self.n_labels = n_labels
+        self.h_dim = h_dim
+        self.p_word_dropout = p_word_dropout
+
+        self.device = device
+
+        """
+        Word embeddings layer
+        """
+        if pretrained_embeddings is None:
+            self.emb_dim = embed_dim
+            self.word_emb = nn.Embedding(n_vocab, embed_dim, self.PAD_IDX)
+        else:
+            print("use random init emb.")
+            sys.exit(1)
+            self.emb_dim = pretrained_embeddings.size(1)
+            self.word_emb = nn.Embedding(n_vocab, self.emb_dim, self.PAD_IDX)
+
+            # Set pretrained embeddings
+            self.word_emb.weight.data.copy_(pretrained_embeddings)
+
+            if freeze_embeddings:
+                self.word_emb.weight.requires_grad = False
+
+
+        self.lstm = nn.LSTM(embed_dim, h_dim, batch_first=True)
+        self.classifier = nn.Sequential(
+            nn.Linear(h_dim, h_dim//2),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(h_dim//2, self.n_labels)
+        )
+
+        self.to(self.device)
+
+    def forward(self, sentence):
+        inputs = self.word_emb(sentence)
+        output, (hn, cn) = self.lstm(inputs)
+        final_output = self.classifier(hn[-1])
+        return F.log_softmax(final_output, dim=1)
+
+
+    def train_model(self, args, dataset, logger):
+        self.train()
+        self.dataset = dataset
+        best_train_acc, best_val_acc, best_test_acc, best_test_epoch = 0, 0, 0, 0
+        trainer = optim.Adam(self.parameters(), lr=args.lr)
+
+        train_iter = dataset.build_train_iter(args.batch_size, self.device)
+        val_iter, test_iter = dataset.build_test_iter(args.batch_size, self.device, shuffle=False)
+
+        for epoch in range(1, args.epochs):
+            for i, subdata in enumerate([train_iter]):
+                for batch in iter(subdata):
+                    inputs, labels = batch.text.t(), batch.label
+                    pred = self.forward(inputs)
+                    loss = F.nll_loss(pred, labels)
+                    trainer.zero_grad()
+                    loss.backward()
+                    trainer.step()
+
+            if epoch % args.log_every == 0:
+                train_acc = self.test(train_iter)
+                val_acc = self.test(val_iter)
+                test_acc = self.test(test_iter)
+                if train_acc > best_train_acc:
+                    best_train_acc = train_acc
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                if test_acc > best_test_acc:
+                    best_test_acc = test_acc
+                    best_test_epoch = epoch
+                print(f'Train Acc: {train_acc:.4f}; Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_test_epoch}')
+
+        logger.info(f'Best Train Acc: {best_train_acc:.4f}; Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_test_epoch}')
+        return best_val_acc, best_test_acc
+
+
+    def test(self, data_iter):
+        self.eval()
+        total_accuracy = []
+        with torch.no_grad():
+            for batch in iter(data_iter):
+                inputs, labels = batch.text.t(), batch.label
+                outputs = self.forward(inputs)
+                accuracy = (outputs.argmax(1) == labels).float().mean().item()
+                total_accuracy.append(accuracy)
+        acc = sum(total_accuracy) / len(total_accuracy)
+        self.train()
+        return acc
+
+
+class LSTMClassiferS(nn.Module):
+    def __init__(self, n_node, n_vocab, n_labels, embed_dim, h_dim, z_dim, p_word_dropout=0.5, unk_idx=0, pad_idx=1,
+                 start_idx=2, eos_idx=3, pretrained_embeddings=None, freeze_embeddings=False, teacher_forcing=True, device=False):
+        super(LSTMClassiferS, self).__init__()
+
+        self.UNK_IDX = unk_idx
+        self.PAD_IDX = pad_idx
+        self.START_IDX = start_idx
+        self.EOS_IDX = eos_idx
+
+        self.n_vocab = n_vocab
+        self.n_labels = n_labels
+        self.h_dim = h_dim
+        self.p_word_dropout = p_word_dropout
+
+        self.device = device
+
+        """
+        Word embeddings layer
+        """
+        if pretrained_embeddings is None:
+            self.emb_dim = embed_dim
+            self.word_emb = nn.Embedding(n_vocab, embed_dim, self.PAD_IDX)
+        else:
+            print("use random init emb.")
+            sys.exit(1)
+            self.emb_dim = pretrained_embeddings.size(1)
+            self.word_emb = nn.Embedding(n_vocab, self.emb_dim, self.PAD_IDX)
+
+            # Set pretrained embeddings
+            self.word_emb.weight.data.copy_(pretrained_embeddings)
+
+            if freeze_embeddings:
+                self.word_emb.weight.requires_grad = False
+
+
+        self.lstm = nn.LSTM(embed_dim, h_dim, batch_first=True)
+        self.classifier = nn.Sequential(
+            nn.Linear(h_dim, h_dim//2),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(h_dim//2, self.n_labels)
+        )
+
+        self.eval_classifier = nn.Sequential(
+            nn.Linear(h_dim, h_dim//2),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(h_dim//2, self.n_labels)
+        )
+
+        self.to(self.device)
+
+    def forward(self, sentence):
+        inputs = self.word_emb(sentence)
+        output, (hn, cn) = self.lstm(inputs)
+        return hn
+
+
+    def forward_classiferS(self, sentence):
+        inputs = self.dataset.TEXT.vocab.vectors[sentence].to(self.device)
+        output, (hn, cn) = self.lstm(inputs)
+        return hn
+
+    def train_model(self, args, dataset, logger):
+        self.train()
+        self.dataset = dataset
+        best_train_acc, best_val_acc, best_test_acc, best_test_epoch = 0, 0, 0, 0
+        trainer = optim.Adam(self.parameters(), lr=args.lr)
+        all_iter = dataset.build_all_iter(args.batch_size, self.device)
+        # train_iter = dataset.build_train_iter(args.batch_size, self.device)
+        # val_iter, test_iter = dataset.build_test_iter(args.batch_size, self.device, shuffle=False)
+
+        for epoch in range(1, args.epochs):
+            for i, subdata in enumerate([all_iter]):
+                for batch in iter(subdata):
+                    inputs, labels = batch.text.t(), batch.label
+                    hn = self.forward(inputs)
+                    final_output = self.classifier(hn[-1])
+                    pred = F.log_softmax(final_output, dim=1)
+                    loss = F.nll_loss(pred, labels)
+                    trainer.zero_grad()
+                    loss.backward()
+                    trainer.step()
+
+            if epoch % args.log_every == 0:
+                train_acc, val_acc, test_acc = self.train_model_classifier(args)
+                if train_acc > best_train_acc:
+                    best_train_acc = train_acc
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                if test_acc > best_test_acc:
+                    best_test_acc = test_acc
+                    best_test_epoch = epoch
+                print(f'Train Acc: {train_acc:.4f}; Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_test_epoch}')
+                logger.info(
+                    f'Best Train Acc: {best_train_acc:.4f}; Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_test_epoch}')
+
+        # logger.info(f'Best Train Acc: {best_train_acc:.4f}; Best Valid Acc: {best_val_acc:.4f}; Best Test Acc: {best_test_acc:.4f} @ epoch {best_test_epoch}')
+        return best_val_acc, best_test_acc
+
+
+
+    def train_model_classifier(self, args):
+        trainer_C = optim.Adam(filter(lambda p: p.requires_grad, self.eval_classifier.parameters()), lr=args.eval_lr)
+        criterion_cls = nn.CrossEntropyLoss().to(self.device)
+
+        train_iter = self.dataset.build_train_iter(args.eval_batch_size, self.device)
+        val_iter, test_iter = self.dataset.build_test_iter(args.batch_size, self.device)
+        best_train_acc, best_val_acc, best_test_acc, best_iter = 0, 0, 0, 0
+
+        for epoch in range(1, args.eval_epochs):
+            for batch in iter(train_iter):
+                inputs, labels, mask = batch.text.t(), batch.label, batch.mask.t()
+                hn = self.forward(inputs)
+                final_output = self.eval_classifier(hn[-1])
+                pred = F.log_softmax(final_output, dim=1)
+                loss_cls = criterion_cls(pred, labels)
+                trainer_C.zero_grad()
+                loss_cls.backward()
+                trainer_C.step()
+
+            if epoch % args.log_every == 0:
+                val_acc = self.test(val_iter)
+                test_acc = self.test(test_iter)
+                train_acc = self.test(train_iter)
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_test_acc = test_acc
+                    best_train_acc = train_acc
+
+        return best_train_acc, best_val_acc, best_test_acc
+
+
+    def test(self, data_iter):
+        self.eval()
+        total_accuracy = []
+        with torch.no_grad():
+            for batch in iter(data_iter):
+                inputs, labels = batch.text.t(), batch.label
+                hn = self.forward(inputs)
+                outputs = self.eval_classifier(hn[-1])
+                accuracy = (outputs.argmax(1) == labels).float().mean().item()
+                total_accuracy.append(accuracy)
+        acc = sum(total_accuracy) / len(total_accuracy)
+        self.train()
+        return acc
