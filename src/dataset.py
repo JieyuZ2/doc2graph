@@ -2,6 +2,7 @@ import os
 from collections import defaultdict
 from string import punctuation as punctuation_
 import nltk
+import random
 from nltk.corpus import stopwords
 import torch
 from torchtext import data, datasets
