@@ -16,7 +16,7 @@ def parse_args():
     # general options
     parser.add_argument('--dataset', type=str, default='nyt', choices=['yelp', 'dblp', 'nyt'])
     parser.add_argument("--embed_path", type=str, default='')
-    parser.add_argument('--model', type=str, default='NetGen', choices=['NetGen', 'NetGen1', 'NetGenWord', 'NetGenLink', 'LSTMClassifer'])
+    parser.add_argument('--model', type=str, default='LSTMClassifer', choices=['NetGen', 'NetGenWord', 'NetGenLink', 'LSTMClassifer'])
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument("--prefix", type=str, default='', help="prefix use as addition directory")
     parser.add_argument('--suffix', default='', type=str, help='suffix append to log dir')
