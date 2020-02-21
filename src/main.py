@@ -16,7 +16,7 @@ def parse_args():
     # general options
     parser.add_argument('--dataset', type=str, default='nyt', choices=['yelp', 'dblp', 'nyt'])
     parser.add_argument("--embed_path", type=str, default='')
-    parser.add_argument('--model', type=str, default='NetGenLink', choices=['NetGen', 'NetGen1', 'NetGenWord', 'NetGenLink', 'LSTMClassifer'])
+    parser.add_argument('--model', type=str, default='NetGen', choices=['NetGen', 'NetGen1', 'NetGenWord', 'NetGenLink', 'LSTMClassifer'])
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument("--prefix", type=str, default='', help="prefix use as addition directory")
     parser.add_argument('--suffix', default='', type=str, help='suffix append to log dir')
@@ -26,6 +26,7 @@ def parse_args():
     parser.add_argument('--tag', type=str, default='')
 
     # training options
+    parser.add_argument('--split_ratio', type=str, default="0.8")
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -87,8 +88,9 @@ def main(args):
     parent_path = os.path.abspath(os.path.join(dir_path, os.pardir))
     data_file = os.path.join(parent_path, f'data/{args.dataset}.txt')
 
-    include_all = args.model[-1] == 'S'
-    dataset = Dataset(emb_dim=args.embed_dim, data_file=data_file, include_all=include_all)
+    split_ratio = float(args.split_ratio)
+
+    dataset = Dataset(emb_dim=args.embed_dim, data_file=data_file, split_ratio=split_ratio)
     args.n_labels = dataset.n_labels
 
     logger = init_logger(args)
