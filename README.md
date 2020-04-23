@@ -4,7 +4,7 @@ Please cite the following work if you find the code useful.
 
 ```
 @inproceedings{yang2020neural,
-	Author = {Yang, Carl and Zhang, Jieyu and Wang, Haonan and Li, Bangzhen and Han, Jiawei},
+	Author = {Yang, Carl and Zhang, Jieyu and Wang, Haonan and Li, Bangzheng and Han, Jiawei},
 	Booktitle = {SIGIR},
 	Title = {Neural concept map generation for effective document classification with interpretable structured summarization},
 	Year = {2020}
