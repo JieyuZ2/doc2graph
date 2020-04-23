@@ -15,15 +15,8 @@ Contact: Jieyu Zhang (jieyuz2@illinois.edu), Carl Yang (yangji9181@gmail.com)
 
 ## Prerequisites
 - Python3
-- Pytorch 0.4
-- Tookits like python-igraph, powerlaw, networkx etc.
-
-## Data
+- Pytorch 1.4
 
 ## Training 
-
-```
-python train.py
-```
-with default setttings in `options.py`.
+check out `ru.sh`.
 
