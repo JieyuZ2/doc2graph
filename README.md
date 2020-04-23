@@ -1,4 +1,4 @@
-## Implementation of *CondGen*, NeurIPS 2019.
+## Implementation of *doc2graph*, SIGIR 2020.
 
 Please cite the following work if you find the code useful.
 
