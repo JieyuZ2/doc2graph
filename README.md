@@ -18,5 +18,5 @@ Contact: Jieyu Zhang (jieyuz2@illinois.edu), Carl Yang (yangji9181@gmail.com)
 - Pytorch 1.4
 
 ## Training 
-check out `ru.sh`.
+check out `run.sh`.
 
