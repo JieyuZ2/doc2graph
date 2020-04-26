@@ -1,5 +1,4 @@
 ## Implementation of *doc2graph*, SIGIR 2020.
-### Repository still under construction. Thanks for your patience!
 
 Please cite the following work if you find the code useful.
 
